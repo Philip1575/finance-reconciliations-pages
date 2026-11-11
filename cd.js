@@ -74,7 +74,7 @@ async function cdRoster(file, kind) {
   }
   requireReport(entries.length && new Set(entries.map(entry => entry.account)).size === entries.length, "The template needs distinct G/L accounts.");
   const completion = completionTarget(name, cells, formulas, "F27", "F31", principal ? "I27" : "H27", principal ? "I28" : "H28");
-  return { kind, name, file: file.name, entries, adjustment, completion, periodLabel: String(cells.get("B5") ?? "").trim() };
+  return { kind, name, file: file.name, template: file, entries, adjustment, completion, periodLabel: String(cells.get("B5") ?? "").trim() };
 }
 
 function cdIssuer(value) {
@@ -232,7 +232,7 @@ async function cdInterest(file, entry) {
   }
   const total = rows.reduce((sum, row) => sum + row.amount, 0);
   requireReport(Number.isSafeInteger(total), "Interest exceeds the supported amount range.");
-  return { file: file.name, entry, year, month, day, rows, inactive, exceptions, total };
+  return { file: file.name, template: file, entry, year, month, day, rows, inactive, exceptions, total };
 }
 
 function showCd(result) {
@@ -261,7 +261,28 @@ function showCd(result) {
     row.insertCell().textContent = value;
   }
   cdField("summary").replaceChildren(table);
+  for (const kind of ["principal", "receivable", "interest"]) cdField("download-" + kind).hidden = !result[kind];
+  cdField("principal-draft-note").hidden = !result.principal || result.principal.complete;
   cdField("results").hidden = false;
+}
+
+function cdTemplateUpdates(result, kind, audit) {
+  const group = result[kind];
+  if (kind === "interest") return [["CDs", "L3", group.day], ["CDs", "M3", group.month], ["CDs", "O3", group.year]];
+  const period = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
+    .format(new Date(result.month + "-01T00:00:00Z"));
+  const statementComplete = kind === "principal" && group.complete;
+  const updates = [[group.name, "B5", "For the Month of " + period]];
+  for (const entry of group.entries) {
+    updates.push([group.name, "H" + entry.row, entry.ledger / 100]);
+    if (statementComplete) updates.push([group.name, "I" + entry.row, entry.statement.amount / 100]);
+  }
+  if (group.completion) {
+    updates.push([group.name, group.completion.initials, audit.by],
+      [group.name, group.completion.date, { date: audit.on }]);
+  }
+  if (statementComplete) updates.push([group.name, group.adjustment, result.adjustment / 100]);
+  return updates;
 }
 
 async function buildCd(result) {
@@ -277,8 +298,6 @@ async function buildCd(result) {
     return [name, worksheet("A1:" + cols.at(-1) + (data.length + 1),
       widths.map((width, i) => [i + 1, i + 1, width]), body)];
   }
-  const period = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
-    .format(new Date(result.month + "-01T00:00:00Z"));
   const summary = [["Period", result.month]];
   const paste = [];
   const sheets = [];
@@ -287,17 +306,11 @@ async function buildCd(result) {
   for (const group of [result.principal, result.receivable].filter(Boolean)) {
     const principal = group.kind === "principal";
     summary.push([group.kind + " template", group.file], [group.kind + " ledger total", group.balance / 100]);
-    paste.push([group.file, group.name, "B5", "For the Month of " + period]);
+    paste.push(...cdTemplateUpdates(result, group.kind, audit).map(update => [group.file, ...update]));
     for (const entry of group.entries) {
-      paste.push([group.file, group.name, "H" + entry.row, entry.ledger / 100]);
-      if (principal && group.complete) paste.push([group.file, group.name, "I" + entry.row, entry.statement.amount / 100]);
       savedLedgerRows.push([group.file, group.periodLabel, group.name + "!H" + entry.row, entry.issuer,
         entry.saved === undefined ? "" : entry.saved / 100, entry.ledger / 100,
         entry.change === undefined ? "" : entry.change / 100, result.ledgerSheet + "!" + entry.ledgerSource]);
-    }
-    if (group.completion) {
-      paste.push([group.file, group.name, group.completion.initials, audit.by],
-        [group.file, group.name, group.completion.date, { date: audit.on }]);
     }
     if (!group.complete) {
       summary.push([principal ? "Principal comparison" : "Receivable comparison",
@@ -307,7 +320,6 @@ async function buildCd(result) {
     if (principal && group.complete) {
       summary.push(["Mapped provider principal total", group.statement / 100], ["Reviewed line items", result.adjustment / 100],
         ["Mapped principal difference", result.difference / 100]);
-      paste.push([group.file, group.name, group.adjustment, result.adjustment / 100]);
     }
     if (principal && group.hasProvider) {
       summary.push(["Unmapped provider rows", group.unused.length]);
@@ -345,7 +357,7 @@ async function buildCd(result) {
     summary.push(["Interest template", interest.file], ["Interest entry date", interest.entry],
       ["Calculated interest for supported rows", interest.total / 100], ["Interest rows to review", interest.exceptions.length],
       ["Matured rows with blank interest", interest.inactive.length]);
-    for (const [cell, value] of [["L3", interest.day], ["M3", interest.month], ["O3", interest.year]]) paste.push([interest.file, "CDs", cell, value]);
+    paste.push(...cdTemplateUpdates(result, "interest", audit).map(update => [interest.file, ...update]));
     sheets.push(table("Interest review", ["CDs row", "Issuer", "Purchase", "Maturity", "Accrual days", "Calculated interest"],
       interest.rows.map(item => [item.row, item.issuer, item.purchase, item.maturity, item.days, item.amount / 100]), [12, 38, 16, 16, 16, 24]));
     sheets.push(table("Interest exceptions", ["CDs row", "Issuer", "Review"],
@@ -427,16 +439,22 @@ cdField("run").addEventListener("click", async () => {
   }
 });
 
-cdField("download").addEventListener("click", async () => {
-  const result = cdResult, button = cdField("download");
+async function downloadCd(button, kind) {
+  const result = cdResult;
   if (!result) return;
   button.disabled = true;
   try {
-    const blob = await buildCd(result);
+    const group = result[kind];
+    const blob = group
+      ? await fillExcelTemplate(group.template, cdTemplateUpdates(result, kind, reconciliationAudit()))
+      : await buildCd(result);
     if (cdResult !== result) return;
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "CD investments " + result.month + ".xlsx";
+    const draft = kind === "principal" && !group.complete ? " draft" : "";
+    link.download = group
+      ? "CD " + kind + " " + result.month + draft + "." + group.file.split(".").at(-1)
+      : "CD investments " + result.month + ".xlsx";
     document.body.append(link);
     link.click();
     link.remove();
@@ -446,4 +464,9 @@ cdField("download").addEventListener("click", async () => {
   } finally {
     button.disabled = false;
   }
-});
+}
+
+cdField("download").addEventListener("click", event => downloadCd(event.currentTarget));
+for (const kind of ["principal", "receivable", "interest"]) {
+  cdField("download-" + kind).addEventListener("click", event => downloadCd(event.currentTarget, kind));
+}
