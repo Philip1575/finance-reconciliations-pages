@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Cashier's checks | Finance Reconciliations</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="jszip.min.js"></script>
+  <script defer src="loanstreet.js"></script>
+  <script defer src="covers.js"></script>
+  <script defer src="financial.js"></script>
+  <script defer src="checks.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="organization">Finance Reconciliations</p>
+      <nav aria-label="Reconciliations"><a href="index.html">LoanStreet</a><a href="vault.html">Teller Vault</a><a href="card.html">Corporate Card</a><a href="checks.html" aria-current="page">Cashier's checks</a><a href="vizo.html">VIZO</a><a href="lendkey.html">LendKey</a><a href="student.html">Student Choice</a><a href="fed.html">Federal Reserve</a><a href="cd.html">CD investments</a><a href="suspense.html">Suspense</a></nav>
+      <h1>Cashier's checks</h1>
+      <p>Compare draft history with the prior month's open checks.</p>
+    </header>
+    <section class="panel" aria-label="Period and balance">
+      <div class="mapping">
+        <label>Reconciliation month<input id="month" type="month"></label>
+        <label>Closing account balance<input id="balance" inputmode="decimal"></label>
+        <label>Reviewed line item total<input id="adjustments" inputmode="decimal" value="0.00"></label>
+      </div>
+      <p>Enter line items with their signs as they appear on the existing cover.</p>
+    </section>
+    <section class="panel" aria-labelledby="balance-heading">
+      <h2 id="balance-heading">Closing balance and cover</h2>
+      <div class="drop" id="closing-drop"><label for="closing-file">Optional CUSA ending-balance workbook</label><input id="closing-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="closing-status" role="status"></p>
+      <div class="mapping" id="closing-mapping" hidden>
+        <label>Worksheet (if more than one)<input id="closing-sheet"></label>
+        <label>Verified ending-balance cell<input id="closing-cell" maxlength="10" placeholder="e.g. D28"></label>
+        <label>Date column (optional)<input id="closing-date" maxlength="3" placeholder="e.g. A"></label>
+      </div>
+      <div class="drop" id="cover-drop"><label for="cover-file">Optional prepared current-month reconciliation</label><input id="cover-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="cover-status" role="status"></p>
+      <p>With the balance field blank, the tool reads the selected month’s closing balance from a supported CUSA draft history export. The prepared cover supplies its reviewed line items and paste cells.</p>
+    </section>
+    <section class="panel" aria-labelledby="draft-heading">
+      <h2 id="draft-heading">Draft history</h2>
+      <div class="drop" id="draft-drop"><label for="draft-file">Drop this month's draft history here</label><input id="draft-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div class="mapping" id="draft-mapping" hidden>
+        <label>Worksheet<select id="draft-sheet"></select></label>
+        <label>Date column<input id="date-column" maxlength="3" placeholder="e.g. A"></label>
+        <label>Transaction code column<input id="code-column" maxlength="3" placeholder="e.g. B"></label>
+        <label>Check reference column<input id="reference-column" maxlength="3" placeholder="e.g. C"></label>
+        <label>Signed amount column<input id="amount-column" maxlength="3" placeholder="e.g. D"></label>
+        <label>First data row<input id="first-row" type="number" min="1" max="1048576" value="2"></label>
+        <label>Last data row (optional)<input id="last-row" type="number" min="1" max="1048576"></label>
+      </div>
+      <p id="draft-status" role="status"></p>
+      <details>
+        <summary>Correct reviewed check references</summary>
+        <p>Paste two columns from Excel: the draft worksheet row number and the confirmed check reference. The original file stays available for audit.</p>
+        <label for="reference-corrections">Reference corrections</label>
+        <textarea id="reference-corrections" rows="3" spellcheck="false" placeholder="Source row&#9;Check reference"></textarea>
+      </details>
+      <details>
+        <summary>Record reviewed draft decisions</summary>
+        <p>Paste the draft worksheet row number and Carry or Exclude. Use Carry for a confirmed outstanding issue and Exclude for a row you’ve reviewed and left out.</p>
+        <label for="draft-decisions">Draft decisions</label>
+        <textarea id="draft-decisions" rows="3" spellcheck="false" placeholder="Source row&#9;Action"></textarea>
+      </details>
+    </section>
+    <section class="panel" aria-labelledby="prior-heading">
+      <h2 id="prior-heading">Prior open checks</h2>
+      <div class="drop" id="prior-drop"><label for="prior-file">Drop the prior reconciliation workbook here</label><input id="prior-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="prior-status" role="status"></p>
+      <label class="confirmation"><input id="empty-prior" type="checkbox"> There are no prior outstanding checks.</label>
+    </section>
+    <section class="panel">
+      <button id="run" type="button">Compare checks</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+    <section class="panel" id="results" hidden aria-labelledby="result-heading">
+      <div class="output"><h2 id="result-heading">Proposed reconciliation</h2><button id="download" type="button">Download Excel</button></div>
+      <div id="summary" class="table"></div>
+      <p><strong>Opening checks</strong> contains the prior month’s list before applying this month’s activity. Review <strong>Matches</strong> and <strong>Exceptions</strong>, then use <strong>Checks Outstanding</strong> for the proposed closing list. Paste the <strong>CC Worksheet</strong> block under the new month.</p>
+    </section>
+  </main>
+</body>
+</html>

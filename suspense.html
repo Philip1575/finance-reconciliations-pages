@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Suspense accounts | Finance Reconciliations</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="jszip.min.js"></script>
+  <script defer src="loanstreet.js"></script>
+  <script defer src="covers.js"></script>
+  <script defer src="financial.js"></script>
+  <script defer src="suspense.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="organization">Finance Reconciliations</p>
+      <nav aria-label="Reconciliations"><a href="index.html">LoanStreet</a><a href="vault.html">Teller Vault</a><a href="card.html">Corporate Card</a><a href="checks.html">Cashier's checks</a><a href="vizo.html">VIZO</a><a href="lendkey.html">LendKey</a><a href="student.html">Student Choice</a><a href="fed.html">Federal Reserve</a><a href="cd.html">CD investments</a><a href="suspense.html" aria-current="page">Suspense</a></nav>
+      <h1>Suspense accounts</h1>
+      <p>Review the closing balance and prepare the account's monthly reconciliation.</p>
+    </header>
+    <section class="panel" aria-label="Suspense setup">
+      <div class="mapping">
+        <label>Reconciliation month<input id="month" type="month"></label>
+        <label>Local G/L profile (.json)<input id="profile" type="file" accept=".json"></label>
+      </div>
+      <p id="profile-status" role="status"></p>
+    </section>
+    <section class="panel" aria-labelledby="batch-heading">
+      <h2 id="batch-heading">Prepare all suspense accounts</h2>
+      <p>Load the local G/L profile. The balance list can include other G/L accounts.</p>
+      <label>Batch balance source<select id="batch-source"><option value="paste">Paste from Excel</option><option value="workbook">Upload a trial balance workbook</option></select></label>
+      <div id="batch-paste">
+        <p>Paste G/L account and ending balance. Optional columns in order: expected balance, signed adjustment, description, and reviewed ATM timing date (YYYY-MM-DD). A blank expected balance uses zero. Enter the timing date to apply an ATM transfer offset.</p>
+        <label for="batch-balances">G/L ending balances</label>
+        <textarea id="batch-balances" rows="7" spellcheck="false" placeholder="G/L account&#9;Ending balance"></textarea>
+      </div>
+      <div id="batch-workbook" hidden>
+        <div class="drop" id="batch-drop"><label for="batch-file">Drop the month-end trial balance</label><input id="batch-file" type="file" accept=".xlsx,.xlsm"></div>
+        <p id="batch-file-status" role="status"></p>
+        <div id="batch-map" class="mapping" hidden>
+          <label>Worksheet<select id="batch-sheet"></select></label>
+          <label>G/L account column<input id="batch-account-column" maxlength="3"></label>
+          <label>Ending balance column<input id="batch-balance-column" maxlength="3"></label>
+          <label>First data row<input id="batch-first" type="number" min="1" value="2"></label>
+          <label>Last data row (optional)<input id="batch-last" type="number" min="1"></label>
+        </div>
+        <p>Verify the month and columns. This import uses a zero expected balance and leaves adjustments for review. Use the paste option to enter them in the batch.</p>
+      </div>
+      <button id="batch-run" type="button">Review batch</button>
+      <p id="batch-status" role="status" aria-live="polite"></p>
+      <div id="batch-results" hidden>
+        <div id="batch-summary" class="table"></div>
+        <label class="confirmation"><input id="batch-confirm" type="checkbox"> I reviewed the balances, expected amounts and exceptions for this period.</label>
+        <button id="batch-download" type="button" disabled>Download Excel files (.zip)</button>
+      </div>
+    </section>
+    <section class="panel" aria-labelledby="single-heading">
+      <h2 id="single-heading">Prepare one suspense account</h2>
+      <div class="mapping">
+        <label>Account<select id="mode">
+          <option value="share">Share draft</option><option value="transfer">ATM transfer</option>
+          <option value="ach">ACH settlement</option><option value="atm">ATM exception</option>
+          <option value="teller">Teller operation</option><option value="credit">Exception credit</option>
+          <option value="visa">Visa provisional credit (legacy)</option>
+        </select></label>
+        <label>G/L account<input id="account" maxlength="9"></label>
+        <label>Expected balance<input id="expected" inputmode="decimal" value="0.00"></label>
+      </div>
+      <p id="account-note"></p>
+    </section>
+    <section class="panel" aria-labelledby="ledger-heading">
+      <h2 id="ledger-heading">Closing balance</h2>
+      <label for="source-type">Export type</label>
+      <select id="source-type"><option value="trial">Wisdom trial balance</option><option value="history">CUSA M490 history</option></select>
+      <div class="drop" id="ledger-drop"><label for="ledger-file">Drop the selected account's ledger workbook</label><input id="ledger-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div id="ledger-map" hidden>
+        <div class="mapping">
+          <label>Worksheet<select id="sheet"></select></label>
+          <label>Closing balance column<input id="balance-column" maxlength="3" placeholder="e.g. F"></label>
+        </div>
+        <div class="mapping" id="trial-fields">
+          <label>G/L account column<input id="account-column" maxlength="3" placeholder="e.g. A"></label>
+          <label>First data row<input id="first" type="number" min="1" value="2"></label>
+          <label>Last data row (optional)<input id="last" type="number" min="1"></label>
+        </div>
+        <div class="mapping" id="history-fields" hidden>
+          <label>Verified closing balance row<input id="closing-row" type="number" min="1"></label>
+          <label>Date column (optional)<input id="date-column" maxlength="3" placeholder="e.g. A"></label>
+        </div>
+      </div>
+      <p id="ledger-status" role="status"></p>
+    </section>
+    <section class="panel" aria-labelledby="items-heading">
+      <h2 id="items-heading">Line items</h2>
+      <div id="timing-fields" hidden>
+        <p>The manual's ATM timing item offsets the CUSA closing balance. Verify the date and amount before copying it.</p>
+        <label>ATM timing item date<input id="timing-date" type="date"></label>
+      </div>
+      <div class="mapping">
+        <label>Other reviewed line items, signed total<input id="adjustment" inputmode="decimal" value="0.00"></label>
+        <label>Description<input id="adjustment-description"></label>
+      </div>
+    </section>
+    <section class="panel" id="trace-fields" hidden aria-labelledby="trace-heading">
+      <h2 id="trace-heading">ATM exception review</h2>
+      <p>Optionally compare the Daily VIA Offload and IF-67 reports as Excel tables with Date, Reference, and Signed Amount. Use the same amount sign on both sides.</p>
+      <div class="drop" id="via-drop"><label for="via-file">Daily VIA Offload</label><input id="via-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="via-status" role="status"></p>
+      <div class="drop" id="fiserv-drop"><label for="fiserv-file">IF-67</label><input id="fiserv-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="fiserv-status" role="status"></p>
+    </section>
+    <section class="panel">
+      <label class="confirmation"><input id="confirm" type="checkbox"> I verified the account, period, closing balance and line items.</label>
+      <button id="run" type="button">Prepare reconciliation</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+    <section class="panel" id="results" hidden>
+      <div class="output"><h2>Draft reconciliation</h2><button id="download" type="button">Download Excel</button></div>
+      <div id="summary" class="table"></div>
+      <p>Review the cover and line items before copying values to the existing workbook.</p>
+    </section>
+  </main>
+</body>
+</html>

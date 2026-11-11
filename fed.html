@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Federal Reserve | Finance Reconciliations</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="jszip.min.js"></script>
+  <script defer src="loanstreet.js"></script>
+  <script defer src="covers.js"></script>
+  <script defer src="financial.js"></script>
+  <script defer src="pdfjs-worker.js"></script>
+  <script defer src="pdfjs-display.js"></script>
+  <script defer src="fed.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="organization">Finance Reconciliations</p>
+      <nav aria-label="Reconciliations"><a href="index.html">LoanStreet</a><a href="vault.html">Teller Vault</a><a href="card.html">Corporate Card</a><a href="checks.html">Cashier's checks</a><a href="vizo.html">VIZO</a><a href="lendkey.html">LendKey</a><a href="student.html">Student Choice</a><a href="fed.html" aria-current="page">Federal Reserve</a><a href="cd.html">CD investments</a><a href="suspense.html">Suspense</a></nav>
+      <h1>Federal Reserve</h1>
+      <p>Compare daily statement activity, Wisdom settlements, and reviewed timing items.</p>
+    </header>
+    <section class="panel" aria-labelledby="batch-heading">
+      <h2 id="batch-heading">Drop the day’s files together</h2>
+      <div class="drop" id="batch-drop"><label for="batch-files">Drop or select the statement, workbooks and supporting files</label><input id="batch-files" type="file" multiple accept=".txt,.pdf,.csv,.xlsx,.xlsm"></div>
+      <p id="batch-status" role="status"></p>
+      <div id="batch-review" hidden>
+        <div class="mapping" id="batch-roles"></div>
+        <button id="batch-apply" type="button">Use these file assignments</button>
+      </div>
+    </section>
+    <section class="panel" aria-label="Reconciliation date and balances">
+      <div class="mapping">
+        <label>Statement date<input id="date" type="date"></label>
+        <label>Statement closing balance<input id="statement-balance" inputmode="decimal"></label>
+        <label>Wisdom closing balance<input id="ledger-balance" inputmode="decimal"></label>
+        <label>Wisdom transaction sign<select id="sign"><option value="">Choose the convention</option><option value="1">Use the imported sign</option><option value="-1">Reverse the imported sign</option></select></label>
+      </div>
+      <p>Enter closing balances here or include a Closing Balance row in each source. Use the sign shown on the reconciliation cover.</p>
+    </section>
+    <section class="panel" aria-labelledby="statement-heading">
+      <h2 id="statement-heading">Fed statement activity</h2>
+      <div class="drop" id="statement-drop"><label for="statement-file">Drop the daily Statement of Account</label><input id="statement-file" type="file" accept=".txt,.pdf,.xlsx,.xlsm,.csv"></div>
+      <p>Use the FedMail text statement, a text PDF, or an Excel or CSV table with Date, Category and Signed Amount or separate Debit and Credit columns.</p>
+      <p id="statement-status" role="status"></p>
+    </section>
+    <section class="panel" aria-labelledby="ledger-heading">
+      <h2 id="ledger-heading">Wisdom activity</h2>
+      <div class="drop" id="ledger-drop"><label for="ledger-file">Drop the reviewed G/L History for the Fed account</label><input id="ledger-file" type="file" accept=".xlsx,.xlsm,.csv"></div>
+      <p>Use Date, Description and Signed Amount, or separate Debit and Credit columns.</p>
+      <label>Next Finance effective date<input id="finance-posting-date" type="date"></label>
+      <p>For Wisdom reports with separate dates, Finance timing follows the effective date. The download records the posting date for review.</p>
+      <p>Include this date in the Fed G/L History. The tool counts next-day provider ACH entries in the current Fed Rec. The date defaults to the next weekday. Adjust it for holidays, and use an optional Finance provider column for entries you have confirmed.</p>
+      <p id="ledger-status" role="status"></p>
+    </section>
+    <section class="panel" aria-labelledby="vizo-heading">
+      <h2 id="vizo-heading">VIZO settlement comparison</h2>
+      <p>Optional. Use both exports and a prepared daily workbook with its VIZO MATCHUP tab. Earlier amounts can come from the reviewed template when the export does not cover their date.</p>
+      <div class="drop" id="vizo-drop"><label for="vizo-file">VIZO settlement activity</label><input id="vizo-file" type="file" accept=".xlsx,.xlsm,.csv"></div>
+      <p id="vizo-status" role="status"></p>
+      <div class="drop" id="settlement-drop"><label for="settlement-file">Wisdom settlement G/L history</label><input id="settlement-file" type="file" accept=".xlsx,.xlsm,.csv"></div>
+      <p id="settlement-status" role="status"></p>
+      <label>Wisdom settlement amount sign<select id="settlement-sign"><option value="1">Use the imported sign</option><option value="-1">Reverse the imported sign</option></select></label>
+      <label>Reviewed forward collection allocations (optional)
+        <textarea id="fed-deposit-allocations" rows="3" spellcheck="false" placeholder="Provider row&#9;Wisdom date&#9;Branch amount&#9;Mobile amount"></textarea>
+      </label>
+      <p>Review the deposit candidates in the first download. Paste the four columns for the allocations you confirm, then prepare the reconciliation again.</p>
+      <p>Use Excel or CSV with Date, Description and Signed Amount, or separate Debit and Credit columns. Label reviewed forward deposits Branch Capture or Mobile Capture. Use Share Draft Suspense for confirmed suspense items. Include a zero No activity row for a verified empty date.</p>
+    </section>
+    <section class="panel" aria-labelledby="template-heading">
+      <h2 id="template-heading">Prepared daily workbook</h2>
+      <div class="drop" id="template-drop"><label for="template-file">Optional workbook with reviewed cover items, Ops inputs, and the date in MATCHUP</label><input id="template-file" type="file" accept=".xlsx,.xlsm"></div>
+      <label>Reviewed cover line items total<input id="adjustment" inputmode="decimal" value="0.00"></label>
+      <p>Without a workbook, enter the signed cover line items total. With a workbook, the tool reads the line items from its cover.</p>
+      <p id="template-status" role="status"></p>
+    </section>
+    <details class="panel">
+      <summary>FedACH sent-file reports for Ops</summary>
+      <div class="drop" id="sent-current-drop"><label for="sent-current-file">Current day Sent Files Summary</label><input id="sent-current-file" type="file" accept=".txt"></div>
+      <p id="sent-current-status" role="status"></p>
+      <div class="drop" id="sent-prior-drop"><label for="sent-prior-file">Prior business day Sent Files Summary</label><input id="sent-prior-file" type="file" accept=".txt"></div>
+      <p id="sent-prior-status" role="status"></p>
+      <label class="confirmation"><input id="sent-approved" type="checkbox"> Include Approved files after checking their status with Ops</label>
+      <p>With a prepared daily workbook, the reports supply the originated debit and credit totals. Accepted files are counted. Other statuses appear in the review.</p>
+    </details>
+    <details class="panel">
+      <summary>Reviewed ACH returns from Report 174</summary>
+      <p>Open the summary page and enter the verified run date and totals. Use zero when the report shows no returns.</p>
+      <div class="drop" id="returns-current-drop"><label for="returns-current-file">Current day Report 174</label><input id="returns-current-file" type="file" accept=".pdf"></div>
+      <p id="returns-current-status" role="status"></p>
+      <div class="mapping">
+        <label>Current report run date<input id="returns-current-date" type="date"></label>
+        <label>Current debit returns<input id="returns-current-debit" inputmode="decimal"></label>
+        <label>Current credit returns<input id="returns-current-credit" inputmode="decimal"></label>
+      </div>
+      <button id="returns-current-preview" type="button">Show current report summary page</button>
+      <div id="returns-current-page" class="table" aria-live="polite"></div>
+      <div class="drop" id="returns-prior-drop"><label for="returns-prior-file">Prior business day Report 174</label><input id="returns-prior-file" type="file" accept=".pdf"></div>
+      <p id="returns-prior-status" role="status"></p>
+      <div class="mapping">
+        <label>Prior report run date<input id="returns-prior-date" type="date"></label>
+        <label>Prior debit returns<input id="returns-prior-debit" inputmode="decimal"></label>
+        <label>Prior credit returns<input id="returns-prior-credit" inputmode="decimal"></label>
+      </div>
+      <button id="returns-prior-preview" type="button">Show prior report summary page</button>
+      <div id="returns-prior-page" class="table" aria-live="polite"></div>
+    </details>
+    <details class="panel">
+      <summary>Check the cover after provider reconciliations post</summary>
+      <p>Keep the original Wisdom balance in the daily inputs. Supply the refreshed closing balance for the same Fed Rec date and select the providers whose entries have posted.</p>
+      <div class="drop" id="refresh-ledger-drop"><label for="refresh-ledger-file">Optional refreshed Wisdom G/L History with a Closing Balance row</label><input id="refresh-ledger-file" type="file" accept=".xlsx,.xlsm,.csv"></div>
+      <p id="refresh-ledger-status" role="status"></p>
+      <div class="mapping">
+        <label>Refreshed Wisdom closing balance<input id="refreshed-balance" inputmode="decimal"></label>
+      </div>
+      <label class="confirmation"><input id="posted-lendkey" type="checkbox"> LendKey postings confirmed</label>
+      <label class="confirmation"><input id="posted-student" type="checkbox"> Student Choice postings confirmed</label>
+    </details>
+    <section class="panel">
+      <label class="confirmation"><input id="confirm" type="checkbox"> I verified the date, source coverage, signs and timing items.</label>
+      <button id="run" type="button">Prepare reconciliation</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+    <section class="panel" id="results" hidden>
+      <div class="output"><h2>Draft daily reconciliation</h2><button id="download" type="button">Download Excel</button></div>
+      <div id="summary" class="table"></div>
+      <p>Review the differences and uncategorized activity. Use the paste list to copy inputs into your workbook and check its existing formulas.</p>
+    </section>
+  </main>
+</body>
+</html>

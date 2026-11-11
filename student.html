@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Student Choice | Finance Reconciliations</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="jszip.min.js"></script>
+  <script defer src="loanstreet.js"></script>
+  <script defer src="covers.js"></script>
+  <script defer src="financial.js"></script>
+  <script defer src="pdfjs-worker.js"></script>
+  <script defer src="pdfjs-display.js"></script>
+  <script defer src="student.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="organization">Finance Reconciliations</p>
+      <nav aria-label="Reconciliations"><a href="index.html">LoanStreet</a><a href="vault.html">Teller Vault</a><a href="card.html">Corporate Card</a><a href="checks.html">Cashier's checks</a><a href="vizo.html">VIZO</a><a href="lendkey.html">LendKey</a><a href="student.html" aria-current="page">Student Choice</a><a href="fed.html">Federal Reserve</a><a href="cd.html">CD investments</a><a href="suspense.html">Suspense</a></nav>
+      <h1>Student Choice</h1>
+      <p>Compare weekly journal activity with Fed settlements and prepare the monthly cover.</p>
+    </header>
+    <section class="panel">
+      <div class="mapping">
+        <label>Reconciliation month<input id="month" type="month"></label>
+        <label>Include journal dates from<input id="start" type="date"></label>
+        <label>Include Fed activity through (optional)<input id="fed-through" type="date"></label>
+        <label>Days to look back from each Fed date<input id="window" type="number" min="0" max="31" value="7"></label>
+      </div>
+    </section>
+    <section class="panel" aria-labelledby="journal-heading">
+      <h2 id="journal-heading">Weekly Transaction Journals</h2>
+      <div class="drop" id="journal-drop"><label for="journal-file">Drop Excel or CSV journals, or weekly ZIPs</label><input id="journal-file" type="file" accept=".xlsx,.xlsm,.csv,.zip" multiple></div>
+      <p>Include the prior month's final week. The importer looks for Effective Date, transaction code, Amount, PRIN, CINT, INT, CFEES and LATE.</p>
+      <p id="journal-status" role="status"></p>
+    </section>
+    <section class="panel" aria-labelledby="fed-heading">
+      <h2 id="fed-heading">Fed activity</h2>
+      <div class="drop" id="fed-drop"><label for="fed-file">Drop the Fed Detailed Trial Balance or reviewed Student Choice activity</label><input id="fed-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p>For reviewed tables, use Date, Direction, Amount and Description. Label a billing debit “Invoice” or use the amount check below.</p>
+      <p id="fed-status" role="status"></p>
+      <p>For a combined Fed workbook, use a Finance provider column to label Student Choice rows.</p>
+    </section>
+    <section class="panel" aria-labelledby="invoice-heading">
+      <h2 id="invoice-heading">Billing invoice</h2>
+      <div class="drop" id="invoice-drop"><label for="invoice-file">Optional PDF or Excel invoice</label><input id="invoice-file" type="file" accept=".pdf,.xlsx,.xlsm"></div>
+      <p id="invoice-status" role="status"></p>
+      <div class="mapping">
+        <label>Invoice total<input id="invoice-amount" inputmode="decimal"></label>
+        <label>Invoice worksheet (if more than one)<input id="invoice-sheet"></label>
+        <label>Invoice total cell<input id="invoice-cell" maxlength="10" placeholder="e.g. F28"></label>
+        <label>Expected Fed debit date (optional)<input id="invoice-date" type="date"></label>
+      </div>
+      <p>The Student Choice PDF supplies the invoice total. For Excel, choose its total cell, or enter the amount manually. If multiple debits share the amount, enter the expected Fed date.</p>
+    </section>
+    <section class="panel" aria-labelledby="cover-heading">
+      <h2 id="cover-heading">Prepared monthly cover</h2>
+      <div class="drop" id="cover-drop"><label for="cover-file">Optional Student Choice workbook with the current Cover Page inputs</label><input id="cover-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p>Use a copy of your monthly cover with its reviewed adjustments. Upload the statement or trial balance below to fill their input cells from the exports.</p>
+      <p id="cover-status" role="status"></p>
+      <div class="drop" id="statement-drop"><label for="statement-file">Student Choice month-end workbook (optional)</label><input id="statement-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="statement-status" role="status"></p>
+      <p>The tool selects the month on statement tabs with Year and Month columns. Enter the verified totals rows for other reports. It checks the reported ending balances and fills refunds when both the statement and cover have a recognized refunds field.</p>
+      <div class="mapping">
+        <label>Principal totals row<input id="principal-total" type="number" min="1"></label>
+        <label>Capitalized Interest totals row<input id="capitalized-total" type="number" min="1"></label>
+        <label>Interest totals row<input id="interest-total" type="number" min="1"></label>
+      </div>
+      <div class="drop" id="wisdom-drop"><label for="wisdom-file">Wisdom trial balance (optional)</label><input id="wisdom-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="wisdom-status" role="status"></p>
+      <div class="mapping">
+        <label>Wisdom worksheet (if more than one)<input id="wisdom-sheet"></label>
+        <label>G/L account column<input id="wisdom-account" value="A" maxlength="3"></label>
+        <label>Ending balance column<input id="wisdom-balance" maxlength="3"></label>
+        <label>First data row<input id="wisdom-first" type="number" value="2" min="1"></label>
+        <label>Last data row (optional)<input id="wisdom-last" type="number" min="1"></label>
+      </div>
+    </section>
+    <section class="panel">
+      <label class="confirmation"><input id="confirm" type="checkbox"> I verified the period, source inputs and reviewed adjustments.</label>
+      <button id="run" type="button">Prepare reconciliation</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+    <section class="panel" id="results" hidden>
+      <div class="output"><h2>Draft reconciliation</h2><button id="download" type="button">Download Excel</button></div>
+      <div id="summary" class="table"></div>
+      <p>Review each MATCHUP difference. When pasting values into your monthly block, copy columns A–F, H, and J and keep its formulas in G.</p>
+    </section>
+  </main>
+</body>
+</html>

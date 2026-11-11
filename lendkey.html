@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>LendKey | Finance Reconciliations</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="jszip.min.js"></script>
+  <script defer src="loanstreet.js"></script>
+  <script defer src="covers.js"></script>
+  <script defer src="financial.js"></script>
+  <script defer src="pdfjs-worker.js"></script>
+  <script defer src="pdfjs-display.js"></script>
+  <script defer src="lendkey-pdf.js"></script>
+  <script defer src="lendkey.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="organization">Finance Reconciliations</p>
+      <nav aria-label="Reconciliations"><a href="index.html">LoanStreet</a><a href="vault.html">Teller Vault</a><a href="card.html">Corporate Card</a><a href="checks.html">Cashier's checks</a><a href="vizo.html">VIZO</a><a href="lendkey.html" aria-current="page">LendKey</a><a href="student.html">Student Choice</a><a href="fed.html">Federal Reserve</a><a href="cd.html">CD investments</a><a href="suspense.html">Suspense</a></nav>
+      <h1>LendKey</h1>
+      <p>Compare ACH activity and recalculate statement roll-forwards.</p>
+    </header>
+    <section class="panel">
+      <label for="month">Reconciliation month</label>
+      <input id="month" type="month">
+    </section>
+    <section class="panel" aria-labelledby="ach-heading">
+      <h2 id="ach-heading">ACH comparison</h2>
+      <p>Provide both exports to compare ACH. Drop the original Fed Detailed Trial Balance, a LendKey-only extract, or a combined workbook with a Finance provider column.</p>
+      <div class="drop" id="ach-drop"><label for="ach-file">LendKey ACH loan detail</label><input id="ach-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div class="mapping" id="ach-map" hidden>
+        <label>Worksheet<select id="ach-sheet"></select></label>
+        <label>Transaction date<input id="ach-date" value="A" maxlength="3"></label>
+        <label>ACH direction<input id="ach-direction" value="B" maxlength="3"></label>
+        <label>Product<input id="ach-product" value="C" maxlength="3"></label>
+        <label>Reason<input id="ach-reason" value="D" maxlength="3"></label>
+        <label>Status (optional)<input id="ach-status-col" value="E" maxlength="3"></label>
+        <label>Amount<input id="ach-amount" value="F" maxlength="3"></label>
+        <label>Fed settlement date (optional)<input id="ach-settlement" maxlength="3"></label>
+        <label>ACH reference (optional)<input id="ach-reference" maxlength="3"></label>
+        <label>Reviewed exclusion reason column (optional)<input id="ach-exclude" maxlength="3"></label>
+        <label>First data row<input id="ach-first" type="number" value="2" min="1"></label>
+        <label>Last data row (optional)<input id="ach-last" type="number" min="1"></label>
+      </div>
+      <p id="ach-status" role="status"></p>
+      <div class="drop" id="fed-drop"><label for="fed-file">Federal Reserve ACH activity</label><input id="fed-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div class="mapping" id="fed-map" hidden>
+        <label>Worksheet<select id="fed-sheet"></select></label>
+        <label>Effective date<input id="fed-date" value="A" maxlength="3"></label>
+        <label>Debit or credit<input id="fed-direction" value="B" maxlength="3"></label>
+        <label>Amount<input id="fed-amount" value="C" maxlength="3"></label>
+        <label>Reference (optional)<input id="fed-reference" maxlength="3"></label>
+        <label>Reviewed exclusion reason column (optional)<input id="fed-exclude" maxlength="3"></label>
+        <label>Finance provider column (optional)<input id="fed-finance-provider" maxlength="3"></label>
+        <label>First data row<input id="fed-first" type="number" value="2" min="1"></label>
+        <label>Last data row (optional)<input id="fed-last" type="number" min="1"></label>
+      </div>
+      <p id="fed-status" role="status"></p>
+      <div class="mapping">
+        <label>Include Fed activity from<input id="from" type="date"></label>
+        <label>Through<input id="through" type="date"></label>
+        <label>Provider direction compared with Fed<select id="direction"><option value="">Choose the convention</option><option value="same">Same debit or credit</option><option value="reverse">Reverse debit and credit</option></select></label>
+      </div>
+      <p>The standard LendKey workbook maps automatically. Rows with missing ACH details appear in source review. The tool checks same-date totals first, then looks for unique batch matches by amount and debit or credit direction across the selected dates.</p>
+      <label for="posting-dates">Confirmed Fed posting dates (optional)</label>
+      <p>To use a confirmed posting date in the daily totals, paste the ACH date, ACH direction as reported by LendKey, and Fed posting date. Review carryovers and adjust the date range as needed.</p>
+      <textarea id="posting-dates" rows="3" spellcheck="false" placeholder="ACH date&#9;ACH direction&#9;Fed posting date"></textarea>
+      <label for="fed-exclusions">Reviewed Fed exclusions (optional)</label>
+      <p>Paste the Fed worksheet row and the reason for excluding it from this reconciliation. The download keeps the row and reason in ACH source review.</p>
+      <textarea id="fed-exclusions" rows="3" spellcheck="false" placeholder="Source row&#9;Reason"></textarea>
+      <label for="fed-confirmed">Reviewed Fed items missing from provider export (optional)</label>
+      <p>For each confirmed item, paste the Fed worksheet row and the reason for including it in the reviewed provider total.</p>
+      <textarea id="fed-confirmed" rows="3" spellcheck="false" placeholder="Source row&#9;Reason"></textarea>
+    </section>
+    <section class="panel" aria-labelledby="purpose-heading">
+      <h2 id="purpose-heading">Purpose Matchup and carryovers</h2>
+      <p>The ACH comparison also prepares the Purpose Matchup rows. Enter optional prior carryovers and current statement amounts to include them in the review.</p>
+      <p>Use positive amounts and leave unavailable figures blank. The workbook lists exact clearing candidates for review.</p>
+      <div id="purpose-inputs"></div>
+    </section>
+    <section class="panel" aria-labelledby="performance-heading">
+      <h2 id="performance-heading">Principal and interest</h2>
+      <div class="drop" id="statements-drop"><label for="statements-file">Drop LendKey monthly statement PDFs</label><input id="statements-file" type="file" accept=".pdf" multiple></div>
+      <p id="statements-status" role="status"></p>
+      <p>Use one PDF per portfolio. The download identifies any lines that still need a reviewed amount.</p>
+      <p>The provider's Home Improvement portfolio summary fills supported statement cells. Add your prepared monthly workbook to calculate all three product roll-forwards using its remaining inputs.</p>
+      <div class="drop" id="portfolio-drop"><label for="portfolio-file">LendKey Home Improvement portfolio workbook</label><input id="portfolio-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="portfolio-status" role="status"></p>
+      <p>If the standard provider workbook is loaded above without a Fed file, its portfolio summary is used here automatically.</p>
+      <div class="drop" id="performance-drop"><label for="performance-file">Workbook with performance statement inputs</label><input id="performance-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="performance-status" role="status"></p>
+      <p>To fill the Cover Page, also drop the verified Wisdom trial balance. Review the CUSA Entries, recalculate and save the monthly workbook before uploading it.</p>
+      <div class="drop" id="wisdom-drop"><label for="wisdom-file">Wisdom trial balance (optional)</label><input id="wisdom-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div class="mapping" id="wisdom-map" hidden>
+        <label>Worksheet<select id="wisdom-sheet"></select></label>
+        <label>G/L account column<input id="wisdom-account" value="A" maxlength="3"></label>
+        <label>Ending balance column<input id="wisdom-balance" maxlength="3"></label>
+        <label>First data row<input id="wisdom-first" type="number" value="2" min="1"></label>
+        <label>Last data row (optional)<input id="wisdom-last" type="number" min="1"></label>
+      </div>
+      <p id="wisdom-status" role="status"></p>
+    </section>
+    <section class="panel">
+      <label class="confirmation"><input id="confirm" type="checkbox"> I verified the source inputs, period and directions for the workflows I selected.</label>
+      <button id="run" type="button">Prepare reconciliation</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+    <section class="panel" id="results" hidden>
+      <div class="output"><h2>Draft reconciliation</h2><button id="download" type="button">Download Excel</button></div>
+      <div id="summary" class="table"></div>
+      <p>Review date and direction differences, prior-period rows, and statement variances before copying the draft values to your monthly workbook.</p>
+    </section>
+  </main>
+</body>
+</html>

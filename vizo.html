@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>VIZO settlements | Finance Reconciliations</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="jszip.min.js"></script>
+  <script defer src="loanstreet.js"></script>
+  <script defer src="covers.js"></script>
+  <script defer src="financial.js"></script>
+  <script defer src="pdfjs-worker.js"></script>
+  <script defer src="pdfjs-display.js"></script>
+  <script defer src="vizo-accounts.js"></script>
+  <script defer src="vizo.js"></script>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="organization">Finance Reconciliations</p>
+      <nav aria-label="Reconciliations"><a href="index.html">LoanStreet</a><a href="vault.html">Teller Vault</a><a href="card.html">Corporate Card</a><a href="checks.html">Cashier's checks</a><a href="vizo.html" aria-current="page">VIZO</a><a href="lendkey.html">LendKey</a><a href="student.html">Student Choice</a><a href="fed.html">Federal Reserve</a><a href="cd.html">CD investments</a><a href="suspense.html">Suspense</a></nav>
+      <h1>VIZO settlements</h1>
+      <p>Prepare monthly transaction groups and review settlement differences.</p>
+    </header>
+    <section class="panel" aria-label="Period and reconciliation">
+      <div class="mapping">
+        <label>VIZO account<select id="mode">
+          <option value="atm">ATM Debit Card Settlement</option><option value="overnight">Overnight Settlement</option>
+          <option value="psa">PSA</option><option value="pcc">PCC</option><option value="misc">MISC</option><option value="charge">Charge Cards</option>
+          <option value="settlement">Settlement</option>
+        </select></label>
+        <label>Reconciliation month<input id="month" type="month"></label>
+        <label>Provider statement ending balance<input id="statement" inputmode="decimal"></label>
+        <label>Reviewed adjustment to ledger balance<input id="adjustment" inputmode="decimal" value="0.00"></label>
+        <label>Ledger sign for comparison<select id="sign"><option value="">Choose the sign</option><option value="1">Use the ledger sign</option><option value="-1">Reverse the ledger sign</option></select></label>
+      </div>
+      <p id="account-note"></p>
+      <div class="mapping" id="charge-fields" hidden>
+        <label>Prior month LoanStreet total on comparison basis<input id="prior-loanstreet" inputmode="decimal"></label>
+        <label>Current LoanStreet in transit, signed adjustment<input id="current-loanstreet" inputmode="decimal"></label>
+      </div>
+      <div class="mapping" id="settlement-fields" hidden>
+        <label>Branch capture ledger date offset (days)<input id="branch-offset" type="number" min="-7" max="7" value="-1"></label>
+        <label>Reviewed forward deposit allocations
+          <textarea id="deposit-allocations" rows="3" spellcheck="false" placeholder="Provider row&#9;Ledger date&#9;Branch amount&#9;Mobile amount"></textarea>
+        </label>
+        <p>Copy the first four columns of reviewed rows from Deposit allocation candidates. Or enter the provider row, Wisdom date, and both amounts. Use zero for an unused amount.</p>
+      </div>
+    </section>
+    <section class="panel" aria-labelledby="provider-heading">
+      <h2 id="provider-heading">VIZO Transaction Summary</h2>
+      <div class="drop" id="provider-drop"><label for="provider-file">Drop the monthly CSV or Excel export here</label><input id="provider-file" type="file" accept=".csv,.xlsx,.xlsm"></div>
+      <div class="mapping" id="provider-map" hidden>
+        <label>Worksheet<select id="provider-sheet"></select></label>
+        <label>Date column<input id="provider-date" maxlength="3" value="A"></label>
+        <label>Description column<input id="provider-desc" maxlength="3" value="B"></label>
+        <label>Signed amount column<input id="provider-amount" maxlength="3" value="C"></label>
+        <label id="provider-class-field" hidden>Reviewed deposit classification column (optional)<input id="provider-class" maxlength="3"></label>
+        <label>First data row<input id="provider-first" type="number" value="2" min="1"></label>
+        <label>Last data row (optional)<input id="provider-last" type="number" min="1"></label>
+      </div>
+      <p id="provider-status" role="status"></p>
+      <label class="confirmation" id="overnight-empty-field" hidden><input type="checkbox" id="overnight-empty"> I verified that Overnight Settlement had no provider activity this month.</label>
+      <p id="provider-class-help" hidden>For generic forward collection rows, use a reviewed classification of Branch Capture or Mobile Capture.</p>
+      <div id="boundary-provider" hidden>
+        <div class="drop" id="boundary-drop"><label for="boundary-file">Optional next-month Settlement Transaction Summary CSV</label><input id="boundary-file" type="file" accept=".csv"></div>
+        <p id="boundary-status" role="status"></p>
+      </div>
+    </section>
+    <details class="panel">
+      <summary>Compare transfers between VIZO accounts</summary>
+      <div class="drop" id="related-drop"><label for="related-files">Optional Transaction Summary CSVs for the other accounts</label><input id="related-files" type="file" accept=".csv" multiple></div>
+      <p id="related-status" role="status"></p>
+      <p>Use original VIZO CSVs. The download lists same-day transfers and overdrafts with equal amounts on opposite sides.</p>
+    </details>
+    <section class="panel" aria-labelledby="closing-heading">
+      <h2 id="closing-heading">Provider closing balance</h2>
+      <label>Closing balance source<select id="statement-mode"><option value="manual">Enter the balance</option><option value="running">Transaction Summary running balance</option><option value="provider">Transaction Summary cell</option><option value="statement">Separate statement workbook</option></select></label>
+      <div id="statement-upload" hidden>
+        <div class="drop" id="statement-drop"><label for="statement-file">Drop the closing statement workbook</label><input id="statement-file" type="file" accept=".xlsx,.xlsm"></div>
+        <div id="statement-map" hidden><label>Statement worksheet<select id="statement-sheet"></select></label></div>
+        <p id="statement-status" role="status"></p>
+      </div>
+      <div class="mapping" id="statement-cell-fields" hidden>
+        <label>Verified closing-balance cell<input id="statement-cell" maxlength="10" placeholder="e.g. F28"></label>
+        <label>Closing date column (optional)<input id="statement-date" maxlength="3" placeholder="e.g. A"></label>
+      </div>
+      <p>If the closing row is in the Transaction Summary, set the last transaction row above it.</p>
+    </section>
+    <section class="panel" aria-labelledby="ledger-heading">
+      <h2 id="ledger-heading">Ledger export</h2>
+      <p id="ledger-instructions">Use G/L History for ATM dailies. Include the last three dates of the prior month to cover a possible weekend batch.</p>
+      <label for="ledger-type">Export type</label>
+      <select id="ledger-type"><option value="history">G/L History</option><option value="wisdom">Wisdom Detailed Trial Balance</option><option value="trial">Trial balance</option></select>
+      <div class="drop" id="ledger-drop"><label for="ledger-file">Drop the ledger Excel export here</label><input id="ledger-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div id="ledger-map" hidden>
+        <div class="mapping">
+          <label>Worksheet<select id="ledger-sheet"></select></label>
+          <label>First data row<input id="ledger-first" type="number" value="2" min="1"></label>
+          <label>Last data row (optional)<input id="ledger-last" type="number" min="1"></label>
+        </div>
+        <div class="mapping" id="atm-map">
+          <label>Date column<input id="ledger-date" maxlength="3" value="A"></label>
+          <label>Description column<input id="ledger-desc" maxlength="3" value="B"></label>
+          <label>Debit column<input id="ledger-debit" maxlength="3" value="C"></label>
+          <label>Credit column<input id="ledger-credit" maxlength="3" value="D"></label>
+          <label id="atm-filter">Text identifying ATM daily entries<input id="ledger-filter" placeholder="e.g. ATM DAILIES"></label>
+          <label>Ledger ending balance<input id="ledger-ending" inputmode="decimal"></label>
+          <label>Or use a verified ending-balance cell<input id="ledger-ending-cell" maxlength="10" placeholder="e.g. F28"></label>
+          <label>Closing date column (optional)<input id="ledger-ending-date" maxlength="3" placeholder="e.g. A"></label>
+        </div>
+        <div class="mapping" id="trial-map" hidden>
+          <label>G/L account column<input id="ledger-account" maxlength="3" placeholder="e.g. A"></label>
+          <label>Ending balance column<input id="ledger-balance" maxlength="3" placeholder="e.g. F"></label>
+          <label>Account from your reconciliation<input id="ledger-gl" maxlength="9"></label>
+        </div>
+      </div>
+      <p id="ledger-status" role="status"></p>
+    </section>
+    <section class="panel" id="if67-panel" aria-labelledby="if67-heading" hidden>
+      <h2 id="if67-heading">ATM opening activity and IF-67</h2>
+      <div class="drop" id="atm-opening-drop"><label for="atm-opening-file">Optional prior-month Wisdom history or reviewed ATM matchup</label><input id="atm-opening-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div class="mapping" id="atm-opening-map" hidden><label>Opening activity worksheet<select id="atm-opening-sheet"></select></label></div>
+      <p id="atm-opening-status" role="status"></p>
+      <div class="drop" id="if67-drop"><label for="if67-file">Optional Excel workbook with reviewed IF-67 daily totals</label><input id="if67-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div class="mapping" id="if67-map" hidden>
+        <label>Worksheet<select id="if67-sheet"></select></label>
+        <label>Ledger date column<input id="if67-date" maxlength="3" value="A"></label>
+        <label>Signed settlement total column<input id="if67-settlement" maxlength="3" value="B"></label>
+        <label>Signed ISA difference column<input id="if67-isa" maxlength="3" value="C"></label>
+        <label>First data row<input id="if67-first" type="number" min="1" value="2"></label>
+        <label>Last data row (optional)<input id="if67-last" type="number" min="1"></label>
+      </div>
+      <p>Use one row per ledger date. Enter the settlement on the provider sign basis and the ISA amount on a settlement-minus-ledger basis. Include zero fees explicitly.</p>
+      <p id="if67-status" role="status"></p>
+    </section>
+    <section class="panel" id="loanstreet-panel" aria-labelledby="loanstreet-heading" hidden>
+      <h2 id="loanstreet-heading">LoanStreet G/L History</h2>
+      <div class="drop" id="loanstreet-drop"><label for="loanstreet-file">Optional Wisdom workbook covering the prior and current months</label><input id="loanstreet-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div class="mapping" id="loanstreet-map" hidden>
+        <label>Worksheet<select id="loanstreet-sheet"></select></label>
+        <label>Date column<input id="loanstreet-date" maxlength="3" value="A"></label>
+        <label>Description column<input id="loanstreet-desc" maxlength="3" value="B"></label>
+        <label>Debit column<input id="loanstreet-debit" maxlength="3" value="C"></label>
+        <label>Credit column<input id="loanstreet-credit" maxlength="3" value="D"></label>
+        <label>First data row<input id="loanstreet-first" type="number" min="1" value="2"></label>
+        <label>Last data row (optional)<input id="loanstreet-last" type="number" min="1"></label>
+        <label>Text identifying LoanStreet entries<input id="loanstreet-filter" value="LoanStreet"></label>
+        <label>Prior month comparison sign<select id="loanstreet-prior-sign"><option value="">Choose the sign</option><option value="1">Debit less credit</option><option value="-1">Credit less debit</option></select></label>
+        <label>Current month adjustment sign<select id="loanstreet-current-sign"><option value="">Choose the sign</option><option value="1">Debit less credit</option><option value="-1">Credit less debit</option></select></label>
+      </div>
+      <p>Load the history after posting LoanStreet. Verify the description and signs. A month with no matching entries uses the manual total, if entered.</p>
+      <p id="loanstreet-status" role="status"></p>
+    </section>
+    <section class="panel" id="invoice-panel" aria-labelledby="invoice-heading" hidden>
+      <h2 id="invoice-heading">LendKey billing invoice</h2>
+      <div class="drop" id="invoice-drop"><label for="invoice-file">Optional prior-month invoice PDF</label><input id="invoice-file" type="file" accept=".pdf"></div>
+      <p>Compare the amount due with the VIZO billing debit and review possible Wisdom postings.</p>
+      <p id="invoice-status" role="status"></p>
+    </section>
+    <section class="panel" id="transit-panel" aria-labelledby="transit-heading" hidden>
+      <h2 id="transit-heading">Reviewed in-transit items</h2>
+      <div class="drop" id="transit-drop"><label for="transit-file">Drop the current or prior month’s reconciliation workbook</label><input id="transit-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p>Keep only the open items in the workbook you drop. The draft uses those amounts in place of the adjustment entered above.</p>
+      <p id="transit-status" role="status"></p>
+    </section>
+    <section class="panel">
+      <label class="confirmation"><input id="confirm" type="checkbox"> I verified the account, period, column selections, closing balances, and signs.</label>
+      <button id="run" type="button">Prepare reconciliation</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </section>
+    <section class="panel" id="results" hidden aria-labelledby="result-heading">
+      <p>Use Cover paste cells for the balance and preparer fields in the existing monthly workbook.</p>
+      <div class="output"><h2 id="result-heading">Draft reconciliation</h2><button id="download" type="button">Download Excel</button></div>
+      <div id="summary" class="table"></div>
+      <p>Review the account cover and its transaction schedules before copying values to your monthly reconciliation.</p>
+    </section>
+  </main>
+</body>
+</html>
