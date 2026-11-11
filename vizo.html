@@ -165,6 +165,11 @@
       <p>Keep only the open items in the workbook you drop. The draft uses those amounts in place of the adjustment entered above.</p>
       <p id="transit-status" role="status"></p>
     </section>
+    <section class="panel" aria-labelledby="template-heading">
+      <h2 id="template-heading">Current month workbook</h2>
+      <div class="drop" id="template-drop"><label for="template-file">Optional prepared workbook for this account</label><input id="template-file" type="file" accept=".xlsx,.xlsm"></div>
+      <p id="template-status" role="status"></p>
+    </section>
     <section class="panel">
       <label class="confirmation"><input id="confirm" type="checkbox"> I verified the account, period, column selections, closing balances, and signs.</label>
       <button id="run" type="button">Prepare reconciliation</button>
@@ -172,8 +177,9 @@
     </section>
     <section class="panel" id="results" hidden aria-labelledby="result-heading">
       <p>Use Cover paste cells for the balance and preparer fields in the existing monthly workbook.</p>
-      <div class="output"><h2 id="result-heading">Draft reconciliation</h2><button id="download" type="button">Download Excel</button></div>
+      <div class="output"><h2 id="result-heading">Draft reconciliation</h2><button id="download" type="button">Download review Excel</button><button id="download-template" type="button" hidden>Download filled workbook</button></div>
       <div id="summary" class="table"></div>
+      <p id="template-download-note" hidden>The filled copy updates balances and completion details. Use the review Excel for transaction schedules and verify the in-transit items in the filled copy.</p>
       <p>Review the account cover and its transaction schedules before copying values to your monthly reconciliation.</p>
     </section>
   </main>

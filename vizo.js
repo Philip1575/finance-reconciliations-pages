@@ -2,7 +2,7 @@
 
 const vizoField = id => document.getElementById(id);
 const vizoFiles = { provider: { revision: 0 }, ledger: { revision: 0 }, statement: { revision: 0 }, if67: { revision: 0 },
-  loanstreet: { revision: 0 }, invoice: { revision: 0 }, transit: { revision: 0 }, "atm-opening": { revision: 0 }, boundary: { revision: 0 } };
+  loanstreet: { revision: 0 }, invoice: { revision: 0 }, transit: { revision: 0 }, "atm-opening": { revision: 0 }, boundary: { revision: 0 }, template: { revision: 0 } };
 let vizoResult;
 let vizoRevision = 0;
 let relatedVizoFiles = [];
@@ -34,7 +34,7 @@ async function selectVizoFile(kind, file) {
   if (kind === "provider") vizoField("overnight-empty").checked = false;
   invalidateVizo();
   const status = vizoField(kind + "-status");
-  if (kind === "invoice" || kind === "transit" || kind === "boundary") {
+  if (["invoice", "transit", "boundary", "template"].includes(kind)) {
     status.textContent = file?.name ?? "";
     if (kind === "transit") showVizoAccount();
     return;
@@ -596,7 +596,57 @@ function showVizo(result) {
     row.insertCell().textContent = amount;
   }
   vizoField("summary").replaceChildren(table);
+  vizoField("download-template").hidden = !result.template;
+  vizoField("template-download-note").hidden = !result.template;
   vizoField("results").hidden = false;
+}
+
+function vizoCoverPaste(result, audit) {
+  const target = result.profile.paste;
+  const sheet = target.sheet ?? "Reconciliation";
+  const rows = [
+    [sheet, "L20", "VIZO statement ending balance", result.statement / 100, result.statementSource],
+    [sheet, target.ledger, "Ledger ending balance", result.ending * result.sign / 100,
+      result.endingSource + (result.sign === -1 ? " · sign reversed" : "")],
+    [sheet, target.initials, "Completed by", audit.by, "Preparer"],
+    [sheet, target.date, "Completed on", audit.on, "Preparer"],
+  ];
+  if (result.mode === "charge" && result.loanStreetTransit !== undefined) {
+    rows.push([sheet, "L21", "LoanStreet in transit on statement side", -result.loanStreetTransit / 100,
+      result.chargeLoanStreet?.current !== undefined ? result.chargeLoanStreet.fileName + " · LoanStreet G/L rows" : "Reviewed adjustment"]);
+  }
+  return rows;
+}
+
+async function fillVizoTemplate(result) {
+  const audit = reconciliationAudit();
+  const target = result.profile.paste;
+  const sheet = target.sheet ?? "Reconciliation";
+  const book = await openExcel(result.template, true);
+  const formulas = new Set();
+  const cells = await readCells(book, sheet, formulas);
+  const label = address => String(cells.get(address) ?? "").trim();
+  const period = label("C13").toLowerCase().replace(/^for the month of\s+/, "").replace(/^septmeber\b/, "september");
+  const monthName = new Intl.DateTimeFormat("en-US", { month: "long", timeZone: "UTC" })
+    .format(new Date(result.month + "-01T00:00:00Z")).toLowerCase();
+  const year = result.month.slice(0, 4);
+  requireReport(vizoAccountMatches(result.mode, label("C11")) && [monthName, monthName + " " + year, result.month].includes(period),
+    "Load the prepared reconciliation for " + result.profile.name + " and " + result.month + ".");
+  const ledgerLabel = "C" + target.ledger.slice(1);
+  requireReport(/^balance per vizo statement$/i.test(label("C20"))
+    && /^balance per (?:wisdom|portico|cusa) g\/l$/i.test(label(ledgerLabel)) && formulas.has(target.difference),
+    "The workbook does not match the balance fields for this account.");
+  const auditRows = [target.initials.slice(1), target.date.slice(1)];
+  requireReport(auditRows.some(row => /^prepared by\s*:?$/i.test(label("H" + row)))
+    && (!cells.has(target.initials) || typeof cells.get(target.initials) === "string")
+    && (!cells.has(target.date) || typeof cells.get(target.date) === "number"),
+    "Check the completion fields on the prepared cover.");
+  const updates = vizoCoverPaste(result, audit).map(([tab, cell, , value]) =>
+    [tab, cell, cell === target.date ? { date: value } : value]);
+  requireReport(!updates.some(([, cell]) => formulas.has(cell))
+    && (result.mode !== "charge" || result.loanStreetTransit === undefined || /loanstreet in transit/i.test(label("E21"))),
+    "Check the mapped input cells on the prepared cover.");
+  return fillExcelTemplate(result.template, updates);
 }
 
 async function buildVizo(result) {
@@ -640,17 +690,9 @@ async function buildVizo(result) {
   const target = result.profile.paste;
   const sheet = target.sheet ?? "Reconciliation";
   const pasteRows = [
-    [sheet, "L20", "VIZO statement ending balance", result.statement / 100, result.statementSource],
-    [sheet, target.ledger, "Ledger ending balance", result.ending * result.sign / 100,
-      result.endingSource + (result.sign === -1 ? " · sign reversed" : "")],
-    [sheet, target.initials, "Completed by", audit.by, "Preparer"],
-    [sheet, target.date, "Completed on", audit.on, "Preparer"],
+    ...vizoCoverPaste(result, audit),
     [sheet, target.difference, "Difference formula", "", "Recalculate in the existing workbook after entering reviewed in-transit items."],
   ];
-  if (result.mode === "charge" && result.loanStreetTransit !== undefined) {
-    pasteRows.push([sheet, "L21", "LoanStreet in transit on statement side", -result.loanStreetTransit / 100,
-      result.chargeLoanStreet?.current !== undefined ? result.chargeLoanStreet.fileName + " · LoanStreet G/L rows" : "Reviewed adjustment"]);
-  }
   const sheets = [
     [result.profile.cover, worksheet("A1:B" + (adjustedRow + 6), [[1, 1, 47], [2, 2, 25]], cover)],
     table("Cover paste cells", ["Destination worksheet", "Cell", "Field", "Paste value", "Source or action"],
@@ -1005,7 +1047,7 @@ vizoField("run").addEventListener("click", async () => {
       branchProvider, boundaryRows, boundaryFile: boundaryFile?.name, transit, noProviderActivity,
       unclassifiedDeposits: unclassifiedDeposits.filter(item => !allocated.has(item.row)), transferReview, allocations,
       priorLoanStreet, loanStreetTransit, chargeLoanStreet, branchOffset, invoice,
-      provider, groups: vizoGroups(provider), ledger, atm, if67, opening, providerSheet, ledgerSheet,
+      provider, groups: vizoGroups(provider), ledger, atm, if67, opening, providerSheet, ledgerSheet, template: vizoFiles.template.file,
       providerFile: providerLoaded ? vizoFiles.provider.file.name : "", ledgerFile: vizoFiles.ledger.file.name };
     showVizo(vizoResult);
     vizoStatus(atm && !atm.comparisons.length ? "No ATM daily descriptions were recognized. Review Provider detail."
@@ -1016,16 +1058,16 @@ vizoField("run").addEventListener("click", async () => {
   }
 });
 
-vizoField("download").addEventListener("click", async () => {
-  const result = vizoResult, button = vizoField("download");
+async function downloadVizo(button, build, suffix) {
+  const result = vizoResult;
   if (!result) return;
   button.disabled = true;
   try {
-    const blob = await buildVizo(result);
+    const blob = await build(result);
     if (result !== vizoResult) return;
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "VIZO " + result.profile.name + " " + result.month + ".xlsx";
+    link.download = "VIZO " + result.profile.name + " " + result.month + suffix(result);
     document.body.append(link);
     link.click();
     link.remove();
@@ -1035,4 +1077,9 @@ vizoField("download").addEventListener("click", async () => {
   } finally {
     button.disabled = false;
   }
-});
+}
+
+vizoField("download").addEventListener("click", event =>
+  downloadVizo(event.currentTarget, buildVizo, () => ".xlsx"));
+vizoField("download-template").addEventListener("click", event =>
+  downloadVizo(event.currentTarget, fillVizoTemplate, result => " filled template." + result.template.name.split(".").at(-1)));
