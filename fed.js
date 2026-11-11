@@ -853,19 +853,7 @@ function dailySummary(result) {
   fedField("results").hidden = false;
 }
 
-async function buildDaily(result) {
-  const audit = reconciliationAudit();
-  const { label, number, row, worksheet } = excelOutputCells();
-  function table(name, headers, data, widths) {
-    const cols = "ABCDEFGHIJKLMN".slice(0, headers.length);
-    const body = row(1, headers.map((title, i) => label(cols[i] + "1", title, 1)).join(""))
-      + data.map((entry, i) => row(i + 2, entry.map((value, j) => {
-        const cell = cols[j] + (i + 2);
-        return typeof value === "number" ? number(cell, value) : label(cell, value);
-      }).join(""))).join("");
-    return [name, worksheet("A1:" + cols.at(-1) + (data.length + 1),
-      widths.map((width, i) => [i + 1, i + 1, width]), body)];
-  }
+function dailyPasteInputs(result) {
   const paste = [
     ["Cover", "K10", "Fed statement balance", result.statementBalance / 100],
     ...((!result.template || result.template.balanceWritable) && (!result.clearing || result.clearing.issues.length)
@@ -890,6 +878,22 @@ async function buildDaily(result) {
   }
   if (result.vizo) paste.push(...result.vizo.paste);
   if (result.template?.opsPaste.length) paste.push(...result.template.opsPaste);
+  return paste;
+}
+
+async function buildDaily(result) {
+  const audit = reconciliationAudit();
+  const { label, number, row, worksheet } = excelOutputCells();
+  function table(name, headers, data, widths) {
+    const cols = "ABCDEFGHIJKLMN".slice(0, headers.length);
+    const body = row(1, headers.map((title, i) => label(cols[i] + "1", title, 1)).join(""))
+      + data.map((entry, i) => row(i + 2, entry.map((value, j) => {
+        const cell = cols[j] + (i + 2);
+        return typeof value === "number" ? number(cell, value) : label(cell, value);
+      }).join(""))).join("");
+    return [name, worksheet("A1:" + cols.at(-1) + (data.length + 1),
+      widths.map((width, i) => [i + 1, i + 1, width]), body)];
+  }
   const sourceRow = entry => [entry.source, entry.name, entry.row, entry.date, entry.description,
     entry.raw / 100, entry.amount / 100, entry.category];
   const sourceHeaders = ["Source", "Worksheet", "Row", "Date", "Description", "Imported amount", "Comparison amount", "Category"];
@@ -911,7 +915,7 @@ async function buildDaily(result) {
     ], [40, 60]),
     table("Wire and FedNow", ["Category", "Statement", "Wisdom", "Workbook difference"],
       result.comparisons.map(entry => [entry.category, entry.statement / 100, entry.ledger / 100, entry.difference / 100]), [18, 19, 19, 23]),
-    table("Paste cells", ["Sheet", "Cell", "Input", "Value"], paste, [18, 15, 31, 20]),
+    table("Paste cells", ["Sheet", "Cell", "Input", "Value"], dailyPasteInputs(result), [18, 15, 31, 20]),
     ...completionPasteSheets(result.template?.auditTarget, audit),
     table("Activity review", sourceHeaders, result.activity.map(sourceRow), sourceWidths),
     table("Exceptions", sourceHeaders, result.exceptions.map(sourceRow), sourceWidths),
@@ -973,7 +977,7 @@ async function buildDaily(result) {
       ["G15", "Current returns net less prior returns net", (-(g(13) - g(14)) + (g(11) - g(12))) / 100],
       ["G20", "DAO ACH difference", (g(18) - g(19)) / 100],
       ["E22", "Returns, originated items and DAO ACH", opsCoverAdjustment / 100],
-      ...achItems.map((amount, i) => ["MATCHUP " + "JKLMN"[i] + match.get("ach out"), "Reviewed ACH item", amount / 100]),
+      ...achItems.map((amount, i) => ["MATCHUP " + "JKLMN"[i] + result.template.matches.get("ach out"), "Reviewed ACH item", amount / 100]),
     ], [23, 52, 19]));
   }
   if (result.vizo) {
@@ -1085,9 +1089,35 @@ fedField("run").addEventListener("click", async () => {
     }
     const references = [...dailyReferences, ...["returns-current", "returns-prior"].map(role => dailyFiles[role]?.name)
       .filter(name => name && !returnReports.some(report => report.name === name))];
-    dailyResult = { date, statementBalance, rawLedgerBalance, ledgerBalance, adjustments, adjusted, difference, template, activity, exceptions, vizo, finance, clearing, sentReports, returnReports, references,
-      statementFile: dailyFiles.statement.name, ledgerFile: dailyFiles.ledger.name, templateFile: dailyFiles.template?.name ?? "",
+    const templateSource = dailyFiles.template;
+    const result = { date, statementBalance, rawLedgerBalance, ledgerBalance, adjustments, adjusted, difference, template, activity, exceptions, vizo, finance, clearing, sentReports, returnReports, references, templateSource,
+      statementFile: dailyFiles.statement.name, ledgerFile: dailyFiles.ledger.name, templateFile: templateSource?.name ?? "",
       ...compareDaily(statement, ledger, template, finance, effectiveDateHistory) };
+    const note = fedField("template-download-note");
+    const skipped = [];
+    if (template) {
+      const paste = dailyPasteInputs(result);
+      const formulas = new Map(await Promise.all([...new Set(paste.map(([sheet]) => sheet))].map(async sheet => {
+        const cells = new Set();
+        await readCells(template.book, sheet, cells);
+        return [sheet, cells];
+      })));
+      result.templateUpdates = [];
+      for (const [sheet, address, , value] of paste) {
+        if (formulas.get(sheet).has(address)) skipped.push(sheet + "!" + address);
+        else result.templateUpdates.push([sheet, address, value]);
+      }
+    }
+    if (current !== dailyRevision) return;
+    const canFill = Boolean(template && (result.templateUpdates.length || template.auditTarget));
+    fedField("download-template").hidden = !canFill;
+    note.hidden = !canFill;
+    note.textContent = [
+      "The filled copy includes inputs and completion details in your prepared workbook.",
+      skipped.length ? "Use the review Excel to check proposed values for formula cells " + skipped.join(", ") + "." : "",
+      clearing ? "Use the review Excel for any proposed provider clearing changes." : "",
+    ].filter(Boolean).join(" ");
+    dailyResult = result;
     dailySummary(dailyResult);
     dailyStatus("");
   } catch (error) {
@@ -1095,16 +1125,26 @@ fedField("run").addEventListener("click", async () => {
   }
 });
 
-fedField("download").addEventListener("click", async () => {
-  const result = dailyResult, button = fedField("download");
+function fillDailyTemplate(result) {
+  const audit = reconciliationAudit();
+  const updates = [...result.templateUpdates];
+  if (result.template.auditTarget) {
+    const { sheet, initials, date } = result.template.auditTarget;
+    updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
+  }
+  return fillExcelTemplate(result.templateSource, updates);
+}
+
+async function downloadDaily(button, build, name) {
+  const result = dailyResult;
   if (!result) return;
   button.disabled = true;
   try {
-    const blob = await buildDaily(result);
+    const blob = await build(result);
     if (dailyResult !== result) return;
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "Federal Reserve " + result.date + ".xlsx";
+    link.download = name(result);
     document.body.append(link);
     link.click();
     link.remove();
@@ -1114,4 +1154,10 @@ fedField("download").addEventListener("click", async () => {
   } finally {
     button.disabled = false;
   }
-});
+}
+
+fedField("download").addEventListener("click", event =>
+  downloadDaily(event.currentTarget, buildDaily, result => "Federal Reserve " + result.date + ".xlsx"));
+fedField("download-template").addEventListener("click", event =>
+  downloadDaily(event.currentTarget, fillDailyTemplate,
+    result => "Federal Reserve " + result.date + " filled template." + result.templateSource.name.split(".").at(-1)));

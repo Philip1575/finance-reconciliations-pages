@@ -637,10 +637,14 @@ scField("run").addEventListener("click", async () => {
       comparison = scCompare(journal, fed, from, to, window, invoice);
       carryoverPending = fed.some(item => item.posted) && [...comparison.fedReview.keys()].some(item => item !== invoice?.match);
     }
-    const cover = wantsCover ? await scCover(scFiles.cover[0], month, carryoverPending ? undefined : comparison) : undefined;
+    const template = scFiles.cover[0];
+    const cover = template ? await scCover(template, month, carryoverPending ? undefined : comparison) : undefined;
     if (current !== scRevision) return;
-    scResult = { month, from, window, comparison, cover, invoice, carryoverPending, coverFile: scFiles.cover[0]?.name,
+    scResult = { month, from, window, comparison, cover, invoice, carryoverPending, template, coverFile: template?.name,
       statementFile: scFiles.statement[0]?.name, wisdomFile: scFiles.wisdom[0]?.name };
+    const canFill = Boolean(cover && (cover.inputs.size || cover.completion));
+    scField("download-template").hidden = !canFill;
+    scField("template-download-note").hidden = !canFill;
     scSummary(scResult);
     scStatus(cover?.providerChecks.some(item => item.calculated !== item.statement)
       ? "A calculated ending balance differs from the provider statement. Review Provider roll-forward."
@@ -650,16 +654,26 @@ scField("run").addEventListener("click", async () => {
   }
 });
 
-scField("download").addEventListener("click", async () => {
-  const result = scResult, button = scField("download");
+function fillStudentTemplate(result) {
+  const audit = reconciliationAudit();
+  const updates = [...result.cover.inputs].map(([row, input]) => ["Cover Page", "K" + row, input.amount / 100]);
+  if (result.cover.completion) {
+    const { sheet, initials, date } = result.cover.completion;
+    updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
+  }
+  return fillExcelTemplate(result.template, updates);
+}
+
+async function downloadStudent(button, build, name) {
+  const result = scResult;
   if (!result) return;
   button.disabled = true;
   try {
-    const blob = await buildStudent(result);
+    const blob = await build(result);
     if (result !== scResult) return;
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "Student Choice " + result.month + ".xlsx";
+    link.download = name(result);
     document.body.append(link);
     link.click();
     link.remove();
@@ -669,4 +683,10 @@ scField("download").addEventListener("click", async () => {
   } finally {
     button.disabled = false;
   }
-});
+}
+
+scField("download").addEventListener("click", event =>
+  downloadStudent(event.currentTarget, buildStudent, result => "Student Choice " + result.month + ".xlsx"));
+scField("download-template").addEventListener("click", event =>
+  downloadStudent(event.currentTarget, fillStudentTemplate,
+    result => "Student Choice " + result.month + " filled template." + result.template.name.split(".").at(-1)));
