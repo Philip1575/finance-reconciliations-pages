@@ -60,7 +60,7 @@
     </section>
     <section class="panel" aria-labelledby="cover-heading">
       <h2 id="cover-heading">Prepared Corporate Card cover</h2>
-      <div class="drop" id="cover-drop"><label for="cover-file">Optional workbook for cover paste cells</label><input id="cover-file" type="file" accept=".xlsx,.xlsm"></div>
+      <div class="drop" id="cover-drop"><label for="cover-file">Optional prepared current-month workbook</label><input id="cover-file" type="file" accept=".xlsx,.xlsm"></div>
       <p id="cover-status" role="status"></p>
     </section>
     <section class="panel">
@@ -92,7 +92,9 @@
       <p id="selection" role="status"></p>
       <p>Confirm only the items that belong in next month’s opening list. Other unmatched activity goes to a separate review sheet.</p>
       <label class="confirmation"><input id="confirmed" type="checkbox"> I reviewed the included rows, matching groups, duplicate entries, and carryovers.</label>
-      <button id="download" type="button" disabled>Download Excel</button>
+      <button id="download" type="button" disabled>Download review Excel</button>
+      <button id="download-template" type="button" hidden disabled>Download filled workbook</button>
+      <p id="template-download-note" hidden></p>
       <p>Copy the new monthly block from <strong>Matchup</strong> into your existing Matchup sheet. Replace the prior funding rows using <strong>Pending Charges</strong> and verify that the existing total covers every new row. Review unmatched charges and excluded rows in the download.</p>
     </section>
     <aside>File processing runs on this device. Invoice collection, funding entries, and expense approvals remain finance steps.</aside>

@@ -124,6 +124,7 @@ async function fillExcelTemplate(file, updates) {
       const location = /^([A-Z]{1,3})([1-9]\d*)$/.exec(address);
       requireReport(location && rows.has(location[2]), "Missing template row at " + sheet + "!" + address + ".");
       let cell = cells.get(address);
+      if (!cell && value === null) continue;
       if (!cell) {
         const parent = rows.get(location[2]);
         cell = element(doc, parent, "c");
@@ -136,6 +137,10 @@ async function fillExcelTemplate(file, updates) {
         "The template contains a formula at " + sheet + "!" + address + ".");
       for (const child of Array.from(cell.children)) {
         if (["v", "is"].includes(child.localName)) child.remove();
+      }
+      if (value === null) {
+        cell.removeAttribute("t");
+        continue;
       }
       const text = typeof value === "string";
       cell.setAttribute("t", text ? "inlineStr" : "n");
@@ -168,6 +173,20 @@ async function fillExcelTemplate(file, updates) {
   calc.setAttribute("fullCalcOnLoad", "1");
   workbook.zip.file("xl/workbook.xml", serializer.serializeToString(doc));
   return workbook.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+}
+
+function templateTableUpdates(sheet, range, columns, entries, cells, formulas) {
+  requireReport(entries.length <= range.last - range.first + 1, "Extend the total range on " + sheet + " to include all reviewed rows.");
+  const address = /^([A-Z]+)([1-9]\d*)$/;
+  const allowed = new Set(columns);
+  const inRange = cell => {
+    const match = address.exec(cell);
+    return match && allowed.has(match[1]) && Number(match[2]) >= range.first && Number(match[2]) <= range.last;
+  };
+  requireReport(![...formulas.keys()].some(inRange), "The input range on " + sheet + " contains formulas. Review the paste list.");
+  const updates = new Map([...cells.keys()].filter(inRange).map(cell => [cell, null]));
+  entries.forEach((entry, i) => entry.forEach((value, j) => updates.set(columns[j] + (range.first + i), value)));
+  return [...updates].map(([cell, value]) => [sheet, cell, value]);
 }
 
 async function readLoanStreet(file, month, profile) {

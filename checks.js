@@ -157,9 +157,14 @@ async function readCheckCover(month, file) {
     requireReport(raw !== undefined, "Recalculate and save the line item at Reconciliation!" + address + ".");
     items.push([address, String(cells.get("A" + row) ?? ""), cents(raw)]);
   }
-  const destination = book.sheets.has("Checks Outstanding") ? (await readCheckOutstandingSheet(book)).range : undefined;
+  const outstanding = book.sheets.has("Checks Outstanding") ? await readCheckOutstandingSheet(book) : undefined;
+  const destination = outstanding?.range;
+  const linked = destination && formula("E9").replace(/^\+/, "") === "'CHECKSOUTSTANDING'!D" + destination.totalRow
+    && ["Date Written", "Account Number", "Check Amount", "Check Number", "Reason"]
+      .every((title, i) => String(outstanding.cells.get("BCDEF"[i] + "3") ?? "").trim().toLowerCase() === title.toLowerCase());
   const auditTarget = completionTarget("Reconciliation", cells, formulas, "A26", "A29", "E26", "E27");
-  return { adjustments: items.reduce((sum, [, , amount]) => sum + amount, 0), items, file: file.name, destination, auditTarget };
+  return { adjustments: items.reduce((sum, [, , amount]) => sum + amount, 0), items, file: file.name, template: file,
+    destination, outstanding: linked ? outstanding : undefined, auditTarget };
 }
 
 async function readDraftChecks(workbook, sheet, columns, first, last, month) {
@@ -360,6 +365,12 @@ function displayChecks(result) {
     row.insertCell().textContent = value;
   }
   checkField("summary").replaceChildren(table);
+  checkField("download-template").hidden = !result.cover.template;
+  const note = checkField("template-download-note");
+  note.hidden = !result.cover.template;
+  note.textContent = result.cover.outstanding && !result.pasteRange.overflow
+    ? "The filled copy updates the cover and replaces the outstanding list. Use the review Excel for draft history and exceptions."
+    : "The filled copy updates the cover. Use the review Excel to paste outstanding rows and verify the total range.";
   checkField("results").hidden = false;
 }
 
@@ -549,17 +560,33 @@ checkField("run").addEventListener("click", async () => {
   }
 });
 
-checkField("download").addEventListener("click", async () => {
+function fillChecksTemplate(result) {
+  const audit = reconciliationAudit(), cover = result.cover;
+  const updates = [["Reconciliation", "E5", result.balance / 100]];
+  if (cover.auditTarget) {
+    const { sheet, initials, date } = cover.auditTarget;
+    updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
+  }
+  if (cover.outstanding && !result.pasteRange.overflow) {
+    const { range, cells, formulas } = cover.outstanding;
+    const entries = result.outstanding.map(item => [
+      item.date ? { date: item.date } : item.written || null, item.account || null, item.amount / 100, item.reference || null, item.reason || null,
+    ]);
+    updates.push(...templateTableUpdates("Checks Outstanding", range, "BCDEF", entries, cells, formulas));
+  }
+  return fillExcelTemplate(cover.template, updates);
+}
+
+async function downloadChecks(button, build, name) {
   const result = checkResult;
   if (!result) return;
-  const button = checkField("download");
   button.disabled = true;
   try {
-    const blob = await buildChecks(result);
+    const blob = await build(result);
     if (checkResult !== result) return;
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "Cashiers Checks " + result.month + ".xlsx";
+    link.download = name(result);
     document.body.append(link);
     link.click();
     link.remove();
@@ -569,4 +596,10 @@ checkField("download").addEventListener("click", async () => {
   } finally {
     button.disabled = false;
   }
-});
+}
+
+checkField("download").addEventListener("click", event =>
+  downloadChecks(event.currentTarget, buildChecks, result => "Cashiers Checks " + result.month + ".xlsx"));
+checkField("download-template").addEventListener("click", event =>
+  downloadChecks(event.currentTarget, fillChecksTemplate,
+    result => "Cashiers Checks " + result.month + " filled draft." + result.cover.file.split(".").at(-1)));

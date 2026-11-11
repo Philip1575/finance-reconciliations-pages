@@ -29,6 +29,12 @@ function cardReviewStatus(message, error = false) {
   cardElement("review-status").classList.toggle("error", error);
 }
 
+function updateCardDownloadButtons() {
+  const disabled = !cardRows.length || !cardElement("confirmed").checked || cardDownloading;
+  cardElement("download").disabled = disabled;
+  cardElement("download-template").disabled = disabled || cardElement("download-template").hidden;
+}
+
 function invalidateCard() {
   cardRevision++;
   cardRows = [];
@@ -37,7 +43,7 @@ function invalidateCard() {
   cardSelection.clear();
   cardElement("review").hidden = true;
   cardElement("confirmed").checked = false;
-  cardElement("download").disabled = true;
+  updateCardDownloadButtons();
   cardStatus("");
   cardReviewStatus("");
 }
@@ -80,19 +86,23 @@ async function suggestCardMapping(kind) {
   const [[header, columns]] = matches;
   let last = "";
   if (kind === "prior" && sheet === "Pending Charges") {
-    const amount = columns.get("amount"), date = columns.get("date");
-    const range = new RegExp("^SUM\\(" + amount + "(\\d+):" + amount + "(\\d+)\\)$");
-    const totals = [...formulas].flatMap(([address, formula]) => {
-      const row = Number(/^[A-Z]+(\d+)$/.exec(address)?.[1]);
-      if (row <= header || String(cells.get(date + row) ?? "").trim().toLowerCase() !== "total") return [];
-      const match = range.exec(String(formula).replace(/[\s$]/g, "").toUpperCase());
-      return match && Number(match[1]) === header + 1 && Number(match[2]) >= header + 1 && Number(match[2]) < row ? [match[2]] : [];
-    });
-    if (totals.length === 1) last = totals[0];
+    last = cardPendingRange(cells, formulas, header, columns.get("amount"), columns.get("date"))?.last ?? "";
   }
   for (const [field, column] of columns) cardElement(kind + "-" + field).value = column;
   cardElement(kind + "-first").value = header + 1;
   cardElement(kind + "-last").value = last;
+}
+
+function cardPendingRange(cells, formulas, header, amount, date) {
+  const range = new RegExp("^SUM\\(" + amount + "(\\d+):" + amount + "(\\d+)\\)$");
+  const totals = [...formulas].flatMap(([address, formula]) => {
+    const row = Number(/^[A-Z]+(\d+)$/.exec(address)?.[1]);
+    if (row <= header || String(cells.get(date + row) ?? "").trim().toLowerCase() !== "total") return [];
+    const match = range.exec(String(formula).replace(/[\s$]/g, "").toUpperCase());
+    return match && Number(match[1]) === header + 1 && Number(match[2]) >= header + 1 && Number(match[2]) < row
+      ? [{ first: header + 1, last: Number(match[2]) }] : [];
+  });
+  return totals.length === 1 ? totals[0] : undefined;
 }
 
 async function selectCardFile(kind, file) {
@@ -263,7 +273,6 @@ function flagCardBoundary(source, prior, evidence) {
 
 function renderCard() {
   cardElement("confirmed").checked = false;
-  cardElement("download").disabled = true;
   const active = cardRows.filter(row => row.state !== "excluded");
   const open = cardRows.filter(row => row.state === "open");
   const fingerprints = new Map();
@@ -274,6 +283,17 @@ function renderCard() {
   const duplicates = Array.from(fingerprints.values()).reduce((total, count) => total + Math.max(count - 1, 0), 0);
   const carryovers = open.filter(row => row.carryover);
   const pending = carryovers.filter(row => row.amount > 0);
+  const range = cardCoverReview?.pending?.range;
+  const pendingFits = range && pending.length <= range.last - range.first + 1;
+  const canFill = Boolean(cardCoverReview?.template && (pendingFits || cardCoverReview.auditTarget
+    || cardClosingInput(cardBalanceReview, cardCoverReview)));
+  cardElement("download-template").hidden = !canFill;
+  const note = cardElement("template-download-note");
+  note.hidden = !canFill;
+  note.textContent = pendingFits
+    ? "The filled copy replaces Pending Charges with the reviewed carryovers. Copy the monthly Matchup block from the review Excel."
+    : "Use the review Excel to paste the Pending Charges and Matchup rows. Verify the destination total range.";
+  updateCardDownloadButtons();
   const pendingTotal = pending.reduce((sum, row) => sum + row.amount, 0);
   const boundary = cardRows.filter(row => row.priorEvidence).length;
   cardElement("counts").textContent = active.length + " included · " + carryovers.length + " confirmed carryovers · "
@@ -281,7 +301,7 @@ function renderCard() {
     + (cardRows.length - active.length) + " excluded · " + duplicates + " duplicate rows to review"
     + (boundary ? " · " + boundary + " opening-date rows found in the prior workbook" : "");
   cardElement("pending-preview").textContent = pending.length + " pending funding rows · " + cardMoney.format(pendingTotal / 100)
-    + (pending.length > 10 ? " · Extend the destination total to include the new rows." : "");
+    + (pending.length > (range ? range.last - range.first + 1 : 10) ? " · Extend the destination total to include the new rows." : "");
   cardElement("balance-preview").textContent = cardBalanceReview?.issue ?? (cardBalanceReview?.closing
     ? "Last posted balance for the month: " + cardMoney.format(cardBalanceReview.closing.balance / 100) + " on " + cardBalanceReview.closing.posted
       + (cardBalanceReview.verifyCoverage ? " · Verify month-end coverage" : "") : "");
@@ -485,7 +505,7 @@ function suggestCardSplit() {
 }
 
 async function readCardCover(file, priorWorkbook) {
-  const workbook = file ? await openExcel(file) : priorWorkbook;
+  const workbook = file ? await openExcel(file, true) : priorWorkbook;
   const sheet = "Corp Card";
   const hasCover = workbook?.sheets.has(sheet);
   requireReport(!file || hasCover, "Choose the workbook with the Corp Card cover.");
@@ -497,7 +517,43 @@ async function readCardCover(file, priorWorkbook) {
   const auditTarget = completionTarget(sheet, cells, formulas, "H54", "H58", "L53", "L54");
   const balance = cells.get("L10");
   const balanceTarget = recognized && !formulas.has("L10") && (balance === undefined || typeof balance === "number") ? "L10" : "";
-  return { sheet, auditTarget, balanceTarget };
+  let pending;
+  if (file && workbook.sheets.has("Pending Charges")) {
+    const pendingFormulas = new Map();
+    const pendingCells = await readCells(workbook, "Pending Charges", pendingFormulas);
+    const headers = ["Funding Date", "Tran Code", "Amount", "Description"];
+    if (headers.every((title, i) => String(pendingCells.get("BCDE"[i] + "2") ?? "").trim().toLowerCase() === title.toLowerCase())) {
+      const range = cardPendingRange(pendingCells, pendingFormulas, 2, "D", "B");
+      if (range) pending = { range, cells: pendingCells, formulas: pendingFormulas };
+    }
+  }
+  return { sheet, auditTarget, balanceTarget, template: file, pending };
+}
+
+function cardClosingInput(balances, cover) {
+  return cover.balanceTarget && balances?.closing && !balances.verifyCoverage
+    ? [cover.sheet, cover.balanceTarget, balances.closing.balance / 100] : undefined;
+}
+
+function fillCardTemplate(rows, balances, cover) {
+  const audit = reconciliationAudit();
+  const updates = [];
+  const closing = cardClosingInput(balances, cover);
+  if (closing) updates.push(closing);
+  if (cover.auditTarget) {
+    const { sheet, initials, date } = cover.auditTarget;
+    updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
+  }
+  if (cover.pending) {
+    const { range, cells, formulas } = cover.pending;
+    const entries = rows.filter(item => item.state === "open" && item.carryover && item.amount > 0)
+      .map(item => [{ date: item.date }, item.code || null, item.amount / 100, item.description || null]);
+    if (entries.length <= range.last - range.first + 1) {
+      updates.push(...templateTableUpdates("Pending Charges", range, "BCDE", entries, cells, formulas));
+    }
+  }
+  requireReport(updates.length, "No recognized inputs are available for the prepared workbook.");
+  return fillExcelTemplate(cover.template, updates);
 }
 
 async function buildCardWorkbook(rows, month, balances, cover) {
@@ -574,7 +630,7 @@ async function buildCardWorkbook(rows, month, balances, cover) {
       ...(balances.verifyCoverage ? [["Review", "Verify report coverage through the end of the month."]] : []),
     ]),
   ] : [];
-  const balancePaste = cover.balanceTarget && balances?.closing && !balances.verifyCoverage
+  const balancePaste = cardClosingInput(balances, cover)
     ? [["Cover balance inputs", worksheet("A1:E2", [[1, 1, 20], [2, 2, 13], [3, 3, 20], [4, 4, 18], [5, 5, 45]],
       row(1, headers(["Destination sheet", "Cell", "Paste value", "Posting date", "Source"], "ABCDE"))
       + row(2, label("A2", cover.sheet) + label("B2", cover.balanceTarget) + number("C2", balances.closing.balance / 100)
@@ -675,29 +731,32 @@ cardElement("match").addEventListener("click", () => changeCardRows("matched"));
 cardElement("carry").addEventListener("click", () => changeCardRows("carryover"));
 cardElement("exclude").addEventListener("click", () => changeCardRows("excluded"));
 cardElement("restore").addEventListener("click", () => changeCardRows("open"));
-cardElement("confirmed").addEventListener("change", () => {
-  cardElement("download").disabled = !cardRows.length || !cardElement("confirmed").checked || cardDownloading;
-});
-cardElement("download").addEventListener("click", async () => {
-  if (cardElement("download").disabled) return;
+cardElement("confirmed").addEventListener("change", updateCardDownloadButtons);
+async function downloadCard(button, fill) {
+  if (button.disabled) return;
   const current = cardRevision;
   const selected = cardRows.map(item => ({ ...item }));
+  const month = cardElement("month").value, cover = cardCoverReview;
   cardDownloading = true;
-  cardElement("download").disabled = true;
+  updateCardDownloadButtons();
   try {
-    const blob = await buildCardWorkbook(selected, cardElement("month").value, cardBalanceReview, cardCoverReview);
+    const blob = fill ? await fillCardTemplate(selected, cardBalanceReview, cover)
+      : await buildCardWorkbook(selected, month, cardBalanceReview, cover);
     if (current !== cardRevision || !cardElement("confirmed").checked) return;
     const url = URL.createObjectURL(blob), link = document.createElement("a");
     link.href = url;
-    link.download = "Corporate Card " + cardElement("month").value + ".xlsx";
+    link.download = "Corporate Card " + month + (fill ? " filled draft." + cover.template.name.split(".").at(-1) : ".xlsx");
     document.body.append(link);
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 30000);
   } catch (error) {
-    cardStatus(error.message, true);
+    if (current === cardRevision) cardStatus(error.message, true);
   } finally {
     cardDownloading = false;
-    cardElement("download").disabled = !cardRows.length || !cardElement("confirmed").checked;
+    updateCardDownloadButtons();
   }
-});
+}
+
+cardElement("download").addEventListener("click", event => downloadCard(event.currentTarget, false));
+cardElement("download-template").addEventListener("click", event => downloadCard(event.currentTarget, true));
