@@ -109,7 +109,8 @@
       <p id="status" role="status" aria-live="polite"></p>
     </section>
     <section class="panel" id="results" hidden>
-      <div class="output"><h2>Draft reconciliation</h2><button id="download" type="button">Download Excel</button></div>
+      <div class="output"><h2>Draft reconciliation</h2><button id="download" type="button">Download review Excel</button><button id="download-template" type="button" hidden>Download filled LendKey workbook</button></div>
+      <p id="template-download-note" hidden>The filled copy keeps your workbook layout and formulas. It updates the source-backed statement and Wisdom inputs and the audit fields. Use the review download to copy the reviewed ACH and Purpose Matchup blocks.</p>
       <div id="summary" class="table"></div>
       <p>Review date and direction differences, prior-period rows, and statement variances before copying the draft values to your monthly workbook.</p>
     </section>

@@ -61,7 +61,7 @@ The comparison matches unambiguous references and amounts for positive SU issues
 3. Enter any reviewed prior A/R and A/P balances and new in-transit or late-fee amounts by product. Prepare the draft and download Excel. Use **ACH date review** before pairing individual rows in the monthly **Amounts Lineup** block.
 4. Review **Purpose Matchup**, **Purpose totals** and **Carryover review**. The tool stages statement amounts separately. It suggests a prior clearing only if exactly one combination of one to three eligible payment rows matches the amount for the same product and direction. The search covers up to 120 eligible rows. Confirm against the source statements and review which amounts belong in each cash subtotal before pasting the left-side Purpose Matchup rows.
 5. Optionally drop the verified Wisdom trial balance and map its G/L and ending balance columns. The tool takes the account mappings from the prepared workbook's Cover Page formulas. Review, recalculate and save the CUSA Entries before uploading the prepared workbook.
-6. Copy the values listed in **Statement paste cells** and **Cover balance review** to the indicated cells. Check the calculated statement variances and review the adjustments and differences on the Cover Page.
+6. With a prepared workbook loaded, choose **Download filled LendKey workbook** to put source-backed statement and Wisdom inputs and audit fields into a copy of that workbook. Its layout and formulas are preserved and Excel recalculates when it opens. Use **Download review Excel** for the ACH and Purpose Matchup blocks and the source references.
 
 ## Student Choice
 

@@ -821,27 +821,45 @@ lendField("run").addEventListener("click", async () => {
     }
     if (current !== lendRevision) return;
     const purpose = ach ? buildLendPurpose(ach, performance) : undefined;
-    lendResult = { month, from, through, reverse: direction === "reverse", ach, performance, cover, purpose, portfolio, completion, statements,
+    const template = lendSources.performance.file;
+    lendResult = { month, from, through, reverse: direction === "reverse", ach, performance, cover, purpose, portfolio, completion, statements, template,
       portfolioFile: portfolioSource?.file?.name,
       achFile: lendSources.ach.file?.name, fedFile: lendSources.fed.file?.name, performanceFile: lendSources.performance.file?.name,
       wisdomFile: lendSources.wisdom.file?.name };
     showLend(lendResult);
+    const canFill = Boolean(template && (portfolio || statements.size || cover || completion));
+    lendField("download-template").hidden = !canFill;
+    lendField("template-download-note").hidden = !canFill;
     lendStatus("");
   } catch (error) {
     if (current === lendRevision) lendStatus(error.message, true);
   }
 });
 
-lendField("download").addEventListener("click", async () => {
-  const result = lendResult, button = lendField("download");
+function fillLendTemplate(result) {
+  const audit = reconciliationAudit();
+  const updates = result.performance.flatMap(schedule => schedule.entries.flatMap(entry => schedule.fields.flatMap(([row]) => {
+    const provider = lendStatementInput(result.statements, result.portfolio, entry.product, schedule.name, row);
+    return provider ? [[schedule.name, entry.column + row, provider.amount / 100]] : [];
+  })));
+  for (const item of result.cover ?? []) updates.push(["Cover Page", item.ledgerCell, item.ledger / 100]);
+  if (result.completion) {
+    const { sheet, initials, date } = result.completion;
+    updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
+  }
+  return fillExcelTemplate(result.template, updates);
+}
+
+async function downloadLend(button, build, name) {
+  const result = lendResult;
   if (!result) return;
   button.disabled = true;
   try {
-    const blob = await buildLend(result);
+    const blob = await build(result);
     if (result !== lendResult) return;
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = "LendKey " + result.month + ".xlsx";
+    link.download = name(result);
     document.body.append(link);
     link.click();
     link.remove();
@@ -851,4 +869,10 @@ lendField("download").addEventListener("click", async () => {
   } finally {
     button.disabled = false;
   }
-});
+}
+
+lendField("download").addEventListener("click", event =>
+  downloadLend(event.currentTarget, buildLend, result => "LendKey " + result.month + ".xlsx"));
+lendField("download-template").addEventListener("click", event =>
+  downloadLend(event.currentTarget, fillLendTemplate,
+    result => "LendKey " + result.month + " filled template." + result.template.name.split(".").at(-1)));

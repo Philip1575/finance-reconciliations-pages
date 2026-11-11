@@ -52,7 +52,7 @@ async function openExcel(file, allowMacroWorkbook = false) {
   return { zip, relations, sheets, date1904 };
 }
 
-async function readCells({ zip, relations, sheets }, sheetName, formulas) {
+function excelWorksheetPath({ relations, sheets }, sheetName) {
   requireReport(sheets.has(sheetName), "The workbook has no " + sheetName + " worksheet.");
   const relationship = Array.from(relations.getElementsByTagNameNS(packageRelNs, "Relationship"))
     .find(rel => rel.getAttribute("Id") === sheets.get(sheetName));
@@ -60,7 +60,12 @@ async function readCells({ zip, relations, sheets }, sheetName, formulas) {
   requireReport(relationship?.getAttribute("Type") === officeRelNs + "/worksheet" &&
     relationship.getAttribute("TargetMode") !== "External" &&
     /^xl\/worksheets\/[\w.-]+\.xml$/.test(target), "The selected worksheet could not be located.");
-  const worksheet = await readXml(zip, target);
+  return target;
+}
+
+async function readCells(workbook, sheetName, formulas) {
+  const { zip } = workbook;
+  const worksheet = await readXml(zip, excelWorksheetPath(workbook, sheetName));
   let strings = [];
   if (zip.file("xl/sharedStrings.xml")) {
     const shared = await readXml(zip, "xl/sharedStrings.xml");
@@ -97,6 +102,72 @@ async function readCells({ zip, relations, sheets }, sheetName, formulas) {
     }
   }
   return cells;
+}
+
+async function fillExcelTemplate(file, updates) {
+  const workbook = await openExcel(file, true);
+  const serializer = new XMLSerializer();
+  const element = (doc, parent, name) => doc.createElementNS(spreadsheetNs, parent.prefix ? parent.prefix + ":" + name : name);
+  const groups = new Map();
+  for (const [sheet, address, value] of updates) {
+    const group = groups.get(sheet) ?? new Map();
+    requireReport(!group.has(address), "Multiple values target " + sheet + "!" + address + ".");
+    group.set(address, value);
+    groups.set(sheet, group);
+  }
+  for (const [sheet, group] of groups) {
+    const target = excelWorksheetPath(workbook, sheet);
+    const doc = await readXml(workbook.zip, target);
+    const rows = new Map(Array.from(doc.getElementsByTagNameNS(spreadsheetNs, "row"), row => [row.getAttribute("r"), row]));
+    const cells = new Map(Array.from(doc.getElementsByTagNameNS(spreadsheetNs, "c"), cell => [cell.getAttribute("r"), cell]));
+    for (const [address, value] of group) {
+      const location = /^([A-Z]{1,3})([1-9]\d*)$/.exec(address);
+      requireReport(location && rows.has(location[2]), "Missing template row at " + sheet + "!" + address + ".");
+      let cell = cells.get(address);
+      if (!cell) {
+        const parent = rows.get(location[2]);
+        cell = element(doc, parent, "c");
+        cell.setAttribute("r", address);
+        const next = Array.from(parent.children).find(child => child.localName !== "c"
+          || columnNumber(child.getAttribute("r").replace(/\d+$/, "")) > columnNumber(location[1]));
+        parent.insertBefore(cell, next ?? null);
+      }
+      requireReport(!cell.getElementsByTagNameNS(spreadsheetNs, "f").length,
+        "The template contains a formula at " + sheet + "!" + address + ".");
+      for (const child of Array.from(cell.children)) {
+        if (["v", "is"].includes(child.localName)) child.remove();
+      }
+      const text = typeof value === "string";
+      cell.setAttribute("t", text ? "inlineStr" : "n");
+      const output = element(doc, cell, text ? "is" : "v");
+      if (text) {
+        const node = element(doc, output, "t");
+        node.setAttributeNS("http://www.w3.org/XML/1998/namespace", "xml:space", "preserve");
+        node.textContent = value;
+        output.append(node);
+      } else {
+        const epoch = workbook.date1904 ? Date.UTC(1904, 0, 1) : Date.UTC(1899, 11, 30);
+        const number = typeof value === "number" ? value : (Date.parse(value.date + "T00:00:00Z") - epoch) / 86400000;
+        requireReport(Number.isFinite(number), "Invalid value for " + sheet + "!" + address + ".");
+        output.textContent = String(number);
+      }
+      cell.insertBefore(output, cell.firstChild);
+    }
+    workbook.zip.file(target, serializer.serializeToString(doc));
+  }
+  const doc = await readXml(workbook.zip, "xl/workbook.xml");
+  const root = doc.documentElement;
+  let calc = doc.getElementsByTagNameNS(spreadsheetNs, "calcPr")[0];
+  if (!calc) {
+    calc = element(doc, root, "calcPr");
+    const after = ["oleSize", "customWorkbookViews", "pivotCaches", "smartTagPr", "smartTagTypes", "webPublishing",
+      "fileRecoveryPr", "webPublishObjects", "extLst"];
+    root.insertBefore(calc, Array.from(root.children).find(child => after.includes(child.localName)) ?? null);
+  }
+  calc.setAttribute("calcMode", "auto");
+  calc.setAttribute("fullCalcOnLoad", "1");
+  workbook.zip.file("xl/workbook.xml", serializer.serializeToString(doc));
+  return workbook.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
 }
 
 async function readLoanStreet(file, month, profile) {
