@@ -17,6 +17,8 @@ let suspenseNames = {};
 let batchResult;
 let batchExporting = false;
 let batchRevision = 0, batchLoad = 0, batchLedger;
+let suspenseTemplate, templateRevision = 0;
+const suspenseDifferenceFormula = "K10+SUM(K15:K22)-K23";
 addTrialBalanceDetection("", () => suspenseLedger ? [{ book: suspenseLedger }] : [],
   ["account-column", "balance-column", "first", "sheet"]);
 
@@ -204,6 +206,7 @@ function showSuspense(result) {
     row.insertCell().textContent = value;
   }
   spField("summary").replaceChildren(table);
+  spField("download-template").hidden = !suspenseTemplate;
   spField("results").hidden = false;
 }
 
@@ -228,7 +231,7 @@ function suspenseCover(result, audit, cells) {
   if (result.adjustment) rows.push(row(16, label("C16", result.description) + number("K16", result.adjustment / 100)));
   rows.push(
     row(23, label("B23", "Expected balance") + number("K23", result.expected / 100)),
-    row(25, label("B25", "Difference", 1) + `<c r="K25" s="2"><f>K10+SUM(K15:K22)-K23</f><v>${result.difference / 100}</v></c>`),
+    row(25, label("B25", "Difference", 1) + `<c r="K25" s="2"><f>${suspenseDifferenceFormula}</f><v>${result.difference / 100}</v></c>`),
     ...(result.timingPending ? [row(27, label("B27", "Review the ATM cutoff before filing."))] : []),
     row(34, label("G34", "Prepared By") + label("K34", audit.by)),
     row(35, label("G35", "Completed on") + date("K35", audit.on)),
@@ -237,6 +240,53 @@ function suspenseCover(result, audit, cells) {
   return ["Reconciliation", worksheet("A1:K37", [[1, 1, 8], [2, 2, 29], [3, 3, 36], [4, 6, 8],
     [7, 7, 17], [8, 8, 13], [9, 9, 8], [10, 10, 14], [11, 11, 21]], rows.join(""),
   ["B4:K4", "B5:K5", "B10:J10", "C14:G14", "C15:G15", "C16:G16", "B23:J23", "B25:J25", "B27:K27", "G34:J34", "G35:J35", "G37:J37"])];
+}
+
+async function readSuspenseTemplate(file) {
+  const workbook = await openExcel(file, true);
+  requireReport(workbook.sheets.size === 1, "Use a workbook containing only the shared suspense cover.");
+  const sheet = [...workbook.sheets.keys()][0];
+  const formulas = new Map(), cells = await readCells(workbook, sheet, formulas);
+  const text = address => String(cells.get(address) ?? "").trim();
+  requireReport(/reconciliation$/i.test(text("B4")) && /^for the month of /i.test(text("B5"))
+    && /^balance per wisdom g\/l$/i.test(text("B10")) && /^difference$/i.test(text("B25"))
+    && ["Item Description", "Date", "Will Clear", "Amount"].every((title, i) => text("CHJK"[i] + "14") === title),
+    "Use the shared suspense cover with the Wisdom balance and in-transit items.");
+  const audit = completionTarget(sheet, cells, formulas, "G34", "G37", "K34", "K35");
+  const difference = formulas.get("K25");
+  requireReport(audit && (!difference || String(difference).replace(/[\s$]/g, "").toUpperCase() === suspenseDifferenceFormula),
+    "Check the completion fields and difference formula on the shared cover.");
+  const clear = templateTableUpdates(sheet, { first: 15, last: 22 }, "CHJK", [], cells, formulas);
+  requireReport(!["B4", "B5", "K10", "B23", "K23", "B27", "K37", "K38"].some(cell => formulas.has(cell))
+    && ["", "Expected balance"].includes(text("B23"))
+    && ["", "Review the ATM cutoff before filing."].includes(text("B27")),
+    "Check the balance and review inputs on the shared cover.");
+  return { file, sheet, clear, difference, extension: file.name.split(".").at(-1) };
+}
+
+function fillSuspenseTemplate(result, audit, template) {
+  const { sheet } = template;
+  const month = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
+    .format(new Date(result.month + "-01T00:00:00Z"));
+  const values = new Map(template.clear.map(([, cell, value]) => [cell, value]));
+  for (const [cell, value] of [
+    ["B4", result.account + " " + result.coverName.toUpperCase() + " RECONCILIATION"],
+    ["B5", "For the Month of " + month], ["K10", result.ending.value / 100],
+    ["B23", result.expected ? "Expected balance" : null], ["K23", result.expected ? result.expected / 100 : null],
+    ["B27", result.timingPending ? "Review the ATM cutoff before filing." : null],
+    ["K34", audit.by], ["K35", { date: audit.on }], ["K37", null], ["K38", null],
+  ]) values.set(cell, value);
+  values.set("K25", { formula: template.difference ?? suspenseDifferenceFormula, cached: result.difference / 100 });
+  if (result.timingDate) {
+    values.set("C15", "ATM closing cutoff timing item");
+    values.set("H15", { date: result.timingDate });
+    values.set("K15", result.timing / 100);
+  }
+  if (result.adjustment) {
+    values.set("C16", result.description);
+    values.set("K16", result.adjustment / 100);
+  }
+  return fillExcelTemplate(template.file, [...values].map(([cell, value]) => [sheet, cell, value]));
 }
 
 async function buildSuspense(result, audit = reconciliationAudit()) {
@@ -315,6 +365,27 @@ for (const input of document.querySelectorAll("input:not([type=file]):not(#confi
 }
 spField("confirm").addEventListener("change", () => { if (!spField("confirm").checked) invalidateSuspense(); });
 
+spField("cover-template").addEventListener("change", async event => {
+  const current = ++templateRevision, file = event.currentTarget.files[0];
+  const status = spField("cover-template-status");
+  suspenseTemplate = undefined;
+  invalidateSuspense();
+  invalidateBatch();
+  status.classList.remove("error");
+  status.textContent = file ? "Checking the shared cover…" : "";
+  if (!file) return;
+  try {
+    const template = await readSuspenseTemplate(file);
+    if (current !== templateRevision) return;
+    suspenseTemplate = template;
+    status.textContent = "Shared cover loaded. Batch downloads will use its layout.";
+  } catch (error) {
+    if (current !== templateRevision) return;
+    status.classList.add("error");
+    status.textContent = error.message;
+  }
+});
+
 spField("run").addEventListener("click", async () => {
   const current = ++suspenseRevision;
   suspenseResult = undefined;
@@ -351,20 +422,23 @@ spField("run").addEventListener("click", async () => {
   }
 });
 
-spField("download").addEventListener("click", async () => {
-  const result = suspenseResult, button = spField("download");
+async function downloadSuspenseSingle(button, filled) {
+  const result = suspenseResult, template = suspenseTemplate;
   if (!result) return;
   button.disabled = true;
   try {
-    const blob = await buildSuspense(result);
+    const blob = filled ? await fillSuspenseTemplate(result, reconciliationAudit(), template) : await buildSuspense(result);
     if (result !== suspenseResult) return;
-    downloadSuspense(blob, "Suspense " + result.name + " " + result.month + ".xlsx");
+    downloadSuspense(blob, "Suspense " + result.name + " " + result.month + (filled ? " filled." + template.extension : ".xlsx"));
   } catch (error) {
     if (result === suspenseResult) spStatus(error.message, true);
   } finally {
     button.disabled = false;
   }
-});
+}
+
+spField("download").addEventListener("click", event => downloadSuspenseSingle(event.currentTarget, false));
+spField("download-template").addEventListener("click", event => downloadSuspenseSingle(event.currentTarget, true));
 
 function downloadSuspense(blob, filename) {
   const link = document.createElement("a");
@@ -556,6 +630,7 @@ spField("batch-run").addEventListener("click", async () => {
     const month = spField("month").value, text = spField("batch-balances").value;
     requireReport(/^\d{4}-\d{2}$/.test(month), "Choose the reconciliation month.");
     requireReport(suspenseProfile.size, "Load the local G/L profile for the suspense accounts.");
+    requireReport(!spField("cover-template").files.length || suspenseTemplate, "Load a valid shared cover or clear the template selection.");
     const workbook = spField("batch-source").value === "workbook";
     requireReport(workbook || (text.trim() && text.length <= 5_000_000), "Paste up to 5 MB of G/L ending balances.");
     const balances = workbook ? await readSuspenseBatchWorkbook(month) : readSuspenseBatch(month, text);
@@ -571,7 +646,7 @@ spField("batch-run").addEventListener("click", async () => {
   }
 });
 spField("batch-download").addEventListener("click", async () => {
-  const result = batchResult, button = spField("batch-download");
+  const result = batchResult, button = spField("batch-download"), template = suspenseTemplate;
   if (batchExporting || !result?.matches.size || !spField("batch-confirm").checked) return;
   batchExporting = true;
   button.disabled = true;
@@ -579,9 +654,9 @@ spField("batch-download").addEventListener("click", async () => {
     const audit = reconciliationAudit();
     const zip = new JSZip();
     for (const item of result.matches.values()) {
-      const workbook = await buildSuspense(item, audit);
+      const workbook = template ? await fillSuspenseTemplate(item, audit, template) : await buildSuspense(item, audit);
       const fileName = item.coverName.replace(/[<>:"/\\|?*\u0000-\u001F]/g, " ").replace(/\s+/g, " ").trim();
-      zip.file(item.account + " " + fileName + " " + item.month + ".xlsx", await workbook.arrayBuffer());
+      zip.file(item.account + " " + fileName + " " + item.month + "." + (template?.extension ?? "xlsx"), await workbook.arrayBuffer());
     }
     const blob = await zip.generateAsync({ type: "blob" });
     if (result === batchResult && spField("batch-confirm").checked) downloadSuspense(blob, "Suspense " + result.month + ".zip");

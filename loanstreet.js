@@ -133,7 +133,9 @@ async function fillExcelTemplate(file, updates) {
           || columnNumber(child.getAttribute("r").replace(/\d+$/, "")) > columnNumber(location[1]));
         parent.insertBefore(cell, next ?? null);
       }
-      requireReport(!cell.getElementsByTagNameNS(spreadsheetNs, "f").length,
+      const existingFormula = cell.getElementsByTagNameNS(spreadsheetNs, "f")[0];
+      const formulaText = value?.formula;
+      requireReport(!existingFormula || formulaText === existingFormula.textContent,
         "The template contains a formula at " + sheet + "!" + address + ".");
       for (const child of Array.from(cell.children)) {
         if (["v", "is"].includes(child.localName)) child.remove();
@@ -152,11 +154,17 @@ async function fillExcelTemplate(file, updates) {
         output.append(node);
       } else {
         const epoch = workbook.date1904 ? Date.UTC(1904, 0, 1) : Date.UTC(1899, 11, 30);
-        const number = typeof value === "number" ? value : (Date.parse(value.date + "T00:00:00Z") - epoch) / 86400000;
+        const number = typeof value === "number" ? value : formulaText ? value.cached
+          : (Date.parse(value.date + "T00:00:00Z") - epoch) / 86400000;
         requireReport(Number.isFinite(number), "Invalid value for " + sheet + "!" + address + ".");
         output.textContent = String(number);
       }
-      cell.insertBefore(output, cell.firstChild);
+      cell.insertBefore(output, existingFormula ? existingFormula.nextSibling : cell.firstChild);
+      if (formulaText && !existingFormula) {
+        const formula = element(doc, cell, "f");
+        formula.textContent = formulaText;
+        cell.insertBefore(formula, output);
+      }
     }
     workbook.zip.file(target, serializer.serializeToString(doc));
   }
