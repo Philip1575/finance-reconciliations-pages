@@ -106,20 +106,27 @@ async function readDetailDestinations(file, month, profile) {
     existingValues.set(sheet, inputs.map(address => cells.get(address)));
   }
   const coverPeriods = [], coverAudit = [];
+  let coverIssue;
   const title = "For the Month of " + new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
     .format(new Date(month + "-01T00:00:00Z"));
-  for (const sheet of new Set([...profile.covers.map(([name]) => name), profile.payable[0]])) {
+  for (const [sheet, ...expected] of [...profile.covers, [profile.payable[0], profile.payable.slice(1)]]) {
     if (!workbook.sheets.has(sheet)) {
+      coverIssue ??= "The prepared workbook is missing " + sheet + ".";
       coverAudit.push([sheet, undefined]);
       continue;
     }
     const formulas = new Set(), cells = await readCells(workbook, sheet, formulas);
+    try {
+      loanStreetCoverMapping(sheet, cells, formulas, expected.length, expected);
+    } catch (error) {
+      coverIssue ??= error.message;
+    }
     coverAudit.push([sheet, findLoanStreetCoverAudit(cells, formulas)]);
     const current = String(cells.get("A3") ?? "").trim();
     const heading = /^for the month of (.+)$/i.exec(current)?.[1];
     if (sheet !== profile.payable[0] && heading && monthHeading(heading) && !formulas.has("A3")) coverPeriods.push([sheet, "A3", current, title]);
   }
-  return { fileName: file.name, addresses, existingValues, monthOnly, coverPeriods, coverAudit };
+  return { fileName: file.name, addresses, existingValues, monthOnly, coverPeriods, coverAudit, coverIssue };
 }
 
 function nextDetailColumn(column) {

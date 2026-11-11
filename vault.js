@@ -109,7 +109,7 @@ async function readVaultCover(month) {
     && !["B13", "K20", "K22", "E28", "K28"].some(address => formulas.has(address))
     && formula("K30") === "K22+K28" && formula("K32") === "K20-K30", "The prepared MV worksheet differs from the supported cover.");
   return { account: normalizeAccount(cells.get("D15")), adjustment: text("K28") ? cents(cells.get("K28")) : 0,
-    description: text("E28"), file: file.name,
+    description: text("E28"), file: file.name, template: file,
     completion: completionTarget("MV", cells, formulas, "G42", "G47", "K42", "K43") };
 }
 
@@ -154,6 +154,7 @@ async function validateVault() {
   const current = ++vaultRevision;
   vaultResult = undefined;
   byId("download").disabled = true;
+  byId("download-template").disabled = true;
   byId("preview").hidden = true;
   byId("status").textContent = "";
   byId("status").classList.remove("error");
@@ -181,10 +182,12 @@ async function validateVault() {
     if (current !== vaultRevision) return;
     vaultResult = { month, account, eod, ledgerCents, adjustment, description, adjusted, difference,
       ledgerFile: vaultSources.ledger.file.name, ledgerSheet: byId("ledger-sheet").value, ledgerAddress: ledger.address, coverFile: cover.file,
-      completion: cover.completion };
+      completion: cover.completion, template: cover.template };
     displayVault(vaultResult);
     byId("preview").hidden = false;
     byId("download").disabled = vaultDownloading;
+    byId("download-template").hidden = !cover.template;
+    byId("download-template").disabled = vaultDownloading;
     byId("status").textContent = difference === 0 ? "Difference is $0.00." : "A difference remains. Review the inputs and reconciling items.";
   } catch (error) {
     if (current !== vaultRevision) return;
@@ -271,26 +274,41 @@ for (const input of document.querySelectorAll("input:not([type=file]), select"))
     validateVault();
   });
 }
-byId("download").addEventListener("click", async () => {
+function fillVaultTemplate(result) {
+  const audit = reconciliationAudit();
+  const updates = [["MV", "K20", result.eod.cents / 100], ["MV", "K22", result.ledgerCents / 100]];
+  if (result.completion) {
+    const { sheet, initials, date } = result.completion;
+    updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
+  }
+  return fillExcelTemplate(result.template, updates);
+}
+
+async function downloadVault(fill) {
   if (!vaultResult || vaultDownloading) return;
   const selected = vaultResult;
   vaultDownloading = true;
   byId("download").disabled = true;
+  byId("download-template").disabled = true;
   try {
-    const blob = await buildVault(selected);
+    const blob = fill ? await fillVaultTemplate(selected) : await buildVault(selected);
     if (selected !== vaultResult) return;
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "Teller Vault " + selected.month + ".xlsx";
+    link.download = "Teller Vault " + selected.month + (fill ? " filled." + selected.template.name.split(".").at(-1) : ".xlsx");
     document.body.append(link);
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 30000);
   } catch (error) {
-    byId("status").textContent = error.message;
+    if (selected === vaultResult) byId("status").textContent = error.message;
   } finally {
     vaultDownloading = false;
     byId("download").disabled = !vaultResult;
+    byId("download-template").disabled = !vaultResult;
   }
-});
+}
+
+byId("download").addEventListener("click", () => downloadVault(false));
+byId("download-template").addEventListener("click", () => downloadVault(true));

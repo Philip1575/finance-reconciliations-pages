@@ -8,6 +8,8 @@ const preview = document.querySelector("#preview");
 const period = document.querySelector("#period");
 const tableContainer = document.querySelector("#table");
 const download = document.querySelector("#download");
+const downloadTemplate = document.querySelector("#download-template");
+const templateDownloadNote = document.querySelector("#template-download-note");
 const wisdomInput = document.querySelector("#wisdom-file");
 const wisdomDrop = document.querySelector("#wisdom-drop");
 const wisdomMapping = document.querySelector("#wisdom-mapping");
@@ -86,6 +88,13 @@ profileDrop.addEventListener("drop", event => {
 
 function syncDownload() {
   download.disabled = downloading || !result || Boolean(ledgerFiles.length && !ledgerResult) || Boolean(detailFile && !detailTarget);
+  const canFill = Boolean(detailTarget && !detailTarget.coverIssue);
+  downloadTemplate.hidden = !canFill;
+  downloadTemplate.disabled = download.disabled || !canFill;
+  templateDownloadNote.hidden = !canFill;
+  templateDownloadNote.textContent = ledgerResult
+    ? "The filled copy updates the consolidated covers and details. Copy KEY INFO from the review Excel."
+    : "The filled copy is marked as a draft. Check the saved ledger amounts and use the review Excel for KEY INFO.";
 }
 
 async function validateDetail() {
@@ -113,7 +122,8 @@ async function validateDetail() {
     detailTarget = target;
     detailStatus.textContent = "Found 40 paste cells across " + target.addresses.size + " detail sheets."
       + (target.monthOnly ? " Verify the year for " + target.monthOnly + " month-only headings." : "")
-      + " Found preparer fields on " + target.coverAudit.filter(([, fields]) => fields).length + " covers.";
+      + " Found preparer fields on " + target.coverAudit.filter(([, fields]) => fields).length + " covers."
+      + (target.coverIssue ? " Filled copy unavailable. " + target.coverIssue : "");
     syncDownload();
   } catch (error) {
     if (current !== detailRevision) return;
@@ -317,22 +327,41 @@ detailClear.addEventListener("click", () => {
   detailFile = undefined;
   validateDetail();
 });
-download.addEventListener("click", async () => {
+function fillLoanStreetTemplate(file, result, wisdom, target) {
+  const audit = reconciliationAudit();
+  const updates = result.profile.details.flatMap(([sheet], index) =>
+    target.addresses.get(sheet).map((address, metric) => [sheet, address, result.values[detailMetrics[metric][1]][index]]));
+  for (const { sheet, account, providerCell, ledgerCell, amount } of coverBalances(result)) {
+    updates.push([sheet, providerCell, amount]);
+    const balance = wisdom?.matches.get(account);
+    if (balance) updates.push([sheet, ledgerCell, balance.amount]);
+  }
+  for (const [sheet, address, , title] of target.coverPeriods) updates.push([sheet, address, title]);
+  for (const [sheet, fields] of target.coverAudit) {
+    if (fields) updates.push([sheet, fields.initials, audit.by], [sheet, fields.date, { date: audit.on }]);
+  }
+  return fillExcelTemplate(file, updates);
+}
+
+async function downloadLoanStreet(button, fill) {
   const selected = result;
-  if (!selected || download.disabled) return;
+  if (!selected || button.disabled) return;
   const selectedLedger = ledgerResult;
   const selectedLedgerRevision = ledgerRevision;
   const selectedDetail = detailTarget;
+  const template = detailFile;
   const selectedDetailRevision = detailRevision;
   downloading = true;
   syncDownload();
   try {
-    const workbook = await buildKeyInfo(selected, selectedLedger, selectedDetail);
+    const workbook = fill ? await fillLoanStreetTemplate(template, selected, selectedLedger, selectedDetail)
+      : await buildKeyInfo(selected, selectedLedger, selectedDetail);
     if (result !== selected || ledgerRevision !== selectedLedgerRevision || detailRevision !== selectedDetailRevision) return;
     const url = URL.createObjectURL(workbook);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "LoanStreet inputs " + selected.month + ".xlsx";
+    link.download = fill ? "LoanStreet " + selected.month + " filled" + (selectedLedger ? "" : " draft") + ".xlsx"
+      : "LoanStreet inputs " + selected.month + ".xlsx";
     document.body.append(link);
     link.click();
     link.remove();
@@ -343,4 +372,7 @@ download.addEventListener("click", async () => {
     downloading = false;
     syncDownload();
   }
-});
+}
+
+download.addEventListener("click", event => downloadLoanStreet(event.currentTarget, false));
+downloadTemplate.addEventListener("click", event => downloadLoanStreet(event.currentTarget, true));

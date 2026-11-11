@@ -41,7 +41,7 @@
       <p id="status" role="status" aria-live="polite"></p>
     </section>
     <section class="panel" aria-labelledby="detail-heading">
-      <h2 id="detail-heading">Prepared detail sheets</h2>
+      <h2 id="detail-heading">Prepared consolidated workbook</h2>
       <p>Optional. Copy the previous month’s detail blocks and rename the new headings. Include the year, such as September 2026, to check it automatically. Select that copy to get exact paste addresses.</p>
       <label for="detail-file">Consolidated LoanStreet workbook (.xlsx)</label>
       <input type="file" id="detail-file" accept=".xlsx">
@@ -77,9 +77,11 @@
           <h2 id="output-heading">Excel preview</h2>
           <p id="period"></p>
         </div>
-        <button type="button" id="download">Download Excel</button>
+        <button type="button" id="download">Download review Excel</button>
+        <button type="button" id="download-template" hidden>Download filled LoanStreet workbook</button>
       </div>
       <div id="table" class="table" tabindex="0" role="region" aria-label="Pool balances"></div>
+      <p id="template-download-note" hidden></p>
       <p>In your copied monthly KEY INFO worksheet, paste values from <strong>G3:N10</strong> and <strong>G12</strong> into the same cells. Check that the pool headers match first.</p>
       <p>Use the <strong>Cover inputs</strong> sheet to find the exact provider and ledger cells to paste into each existing cover. Paste only the listed cells.</p>
       <p>When provided, <strong>Cover period inputs</strong> lists the month labels to update in the prepared covers.</p>

@@ -44,6 +44,47 @@ function validateLoanStreetProfile(profile) {
   return { pools, covers, details, payable, accounts };
 }
 
+function loanStreetCoverMapping(sheet, cells, formulas, count, expected) {
+  const anchors = [...cells].flatMap(([address, value]) => {
+    const row = Number(/^B([1-9]\d?)$/.exec(address)?.[1]);
+    const account = normalizeAccount(value);
+    const label = String(cells.get("A" + row) ?? "").trim();
+    return row && account && (count === 1 ? row === 1 : /^(?:cusa|portico|wisdom):?$/i.test(label)) ? [{ row, account }] : [];
+  }).sort((a, b) => a.row - b.row);
+  requireReport(anchors.length === count, sheet + " has an unexpected number of account labels.");
+  const amountAt = (row, target) => {
+    const amounts = "BCDEFGHIJ".split("").map(column => column + row)
+      .filter(address => Number.isFinite(cells.get(address)) && !formulas.has(address));
+    if (target) {
+      const value = cells.get(target);
+      requireReport(Number(target.slice(1)) === row && !formulas.has(target)
+        && (value === undefined || Number.isFinite(value)) && amounts.every(address => address === target), sheet + "!" + target + " must be a mapped balance input.");
+      return target;
+    }
+    requireReport(amounts.length === 1, sheet + " needs one numeric input on balance row " + row + ". Use a completed workbook.");
+    return amounts[0];
+  };
+  return anchors.map(({ row, account }, index) => {
+    const next = anchors[index + 1]?.row ?? 100;
+    const labels = [...cells].flatMap(([address, value]) => {
+      const line = Number(/^A([1-9]\d?)$/.exec(address)?.[1]);
+      const text = String(value).trim().replace(/\s+/g, " ");
+      return line >= row && line < next ? [[line, text]] : [];
+    });
+    const find = (pattern, target) => {
+      const matches = labels.filter(([, value]) => pattern.test(value));
+      requireReport(matches.length === 1, sheet + " needs one provider and one ledger balance per account.");
+      return amountAt(matches[0][0], target);
+    };
+    const target = expected?.[index];
+    requireReport(!target || account === target[0], sheet + " has a different mapped G/L account.");
+    const provider = find(/^balance per portfolio statement$/i, target?.[1]);
+    const ledger = find(/^balance per (?:cusa|portico|portcio|wisdom) g\/l$/i, target?.[2]);
+    requireReport(provider[0] === ledger[0], sheet + " has inconsistent balance columns.");
+    return [account, provider, ledger];
+  });
+}
+
 async function readLoanStreetWorkbookProfile(file) {
   const book = await openExcel(file);
   const names = [...book.sheets.keys()];
@@ -59,35 +100,7 @@ async function readLoanStreetWorkbookProfile(file) {
   requireReport(apSheet, "The consolidated workbook needs an AP Cover Page.");
   const readCover = async (sheet, count) => {
     const formulas = new Set(), cells = await readCells(book, sheet, formulas);
-    const anchors = [...cells].flatMap(([address, value]) => {
-      const row = Number(/^B([1-9]\d?)$/.exec(address)?.[1]);
-      const account = normalizeAccount(value);
-      const label = String(cells.get("A" + row) ?? "").trim();
-      return row && account && (count === 1 ? row === 1 : /^(?:cusa|portico|wisdom):?$/i.test(label)) ? [{ row, account }] : [];
-    }).sort((a, b) => a.row - b.row);
-    requireReport(anchors.length === count, sheet + " has an unexpected number of account labels.");
-    const amountAt = row => {
-      const amounts = "BCDEFGHIJ".split("").map(column => column + row)
-        .filter(address => typeof cells.get(address) === "number" && Number.isFinite(cells.get(address)) && !formulas.has(address));
-      requireReport(amounts.length === 1, sheet + " needs one numeric input on balance row " + row + ". Use a completed workbook.");
-      return amounts[0];
-    };
-    return anchors.map(({ row, account }, index) => {
-      const next = anchors[index + 1]?.row ?? 100;
-      const labels = [...cells].flatMap(([address, value]) => {
-        const line = Number(/^A([1-9]\d?)$/.exec(address)?.[1]);
-        const text = String(value).trim().replace(/\s+/g, " ");
-        return line >= row && line < next ? [[line, text]] : [];
-      });
-      const find = pattern => {
-        const matches = labels.filter(([, value]) => pattern.test(value));
-        requireReport(matches.length === 1, sheet + " needs one provider and one ledger balance per account.");
-        return amountAt(matches[0][0]);
-      };
-      const provider = find(/^balance per portfolio statement$/i), ledger = find(/^balance per (?:cusa|portico|portcio|wisdom) g\/l$/i);
-      requireReport(provider[0] === ledger[0], sheet + " has inconsistent balance columns.");
-      return [account, provider, ledger];
-    });
+    return loanStreetCoverMapping(sheet, cells, formulas, count);
   };
   const covers = [], details = [];
   const detailPatterns = [/^principal payment\b/i, /^net interest payment\b/i, /^change in a\/?p$/i, /^charge[ -]offs$/i];
