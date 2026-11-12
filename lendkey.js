@@ -178,7 +178,7 @@ async function lendAchRows(kind, from, through, reverse, overrides) {
       const inRange = item.date >= from && item.date <= through;
       return { kind, date: item.date, posted: item.posted, settlement: "", periodDate: item.date, direction, comparison: direction,
         sourceAmount: -item.amount, amount: Math.abs(item.amount), row: item.row, reference: item.description, financeProvider: "LendKey",
-        inRange, included: inRange };
+        product: "", reason: "", status: "", override: "", exclusion: "", review: "", inRange, included: inRange };
     });
   }
   const financeColumn = kind === "fed" ? fields.get("finance-provider") || financeProviderColumn(cells, 1, Math.min(first - 1, 50)) : undefined;
@@ -250,17 +250,20 @@ function compareLendAch(ach, fed) {
   };
 }
 
-function lendReviewedFedRows(fed, text) {
+function lendReviewedFedRows(fed, text, allowProduct = false) {
   const rows = new Map(fed.map(item => [String(item.row), item]));
   const decisions = [];
   for (const [index, line] of text.trim().split(/\r?\n/).entries()) {
     if (!line.trim()) continue;
-    const [number, reason, ...extra] = line.split("\t").map(value => value.trim());
+    const [number, reason, productText = "", ...extra] = line.split("\t").map(value => value.trim());
     if (index === 0 && /^source row$/i.test(number) && /^reason$/i.test(reason ?? "")) continue;
     const item = rows.get(number);
-    requireReport(item && reason && !extra.length,
-      "Review line " + (index + 1) + " needs a distinct eligible Fed source row and a reason.");
-    decisions.push({ item, reason });
+    requireReport(item && reason && !extra.length && (allowProduct || !productText),
+      "Review line " + (index + 1) + " needs a distinct eligible Fed source row and a reason"
+        + (allowProduct ? ", with an optional product." : "."));
+    const product = productText ? lendProducts.find(([, , aliases]) => aliases.includes(productText.toUpperCase()))?.[1] : "";
+    requireReport(product !== undefined, "Review line " + (index + 1) + " product must be Consolidation, Home Improvement or Student.");
+    decisions.push({ item, reason, product });
     rows.delete(number);
   }
   return decisions;
@@ -270,10 +273,11 @@ function lendReviewMissingProvider(result, text) {
   const matches = new Set(result.matches.map(match => match.fed));
   const unmatched = result.dates.flatMap(day => day.sameDate ? [] : day.fedRows
     .filter(item => item.amount && !matches.has(item)).map(item => ({ day, item })));
-  const reviewed = lendReviewedFedRows(unmatched.map(entry => entry.item), text);
+  const reviewed = lendReviewedFedRows(unmatched.map(entry => entry.item), text, true);
   const byRow = new Map(unmatched.map(entry => [entry.item.row, entry.day]));
-  for (const { item, reason } of reviewed) {
+  for (const { item, reason, product } of reviewed) {
     item.providerReview = reason;
+    item.providerProduct = product;
     const day = byRow.get(item.row);
     day.reviewedProvider = (day.reviewedProvider ?? 0) + item.amount;
     const sums = result.sums[item.comparison];
@@ -287,8 +291,10 @@ function lendReviewMissingProvider(result, text) {
 function lendLineupGroups(items) {
   const groups = new Map();
   for (const item of items) {
-    const reason = item.providerDetail && ["REMITTANCE", "REMITTANCE - REVERSAL"].includes(item.reason.toUpperCase()) ? "PMTS" : item.reason;
-    const key = item.providerDetail ? JSON.stringify([item.date, item.settlement, item.direction, item.product, item.reason]) : item.row;
+    // Provider remittances, reversals and refunds are all payment activity, recorded as PMTS on the monthly lineup.
+    const reason = item.providerDetail && ["REMITTANCE", "REMITTANCE - REVERSAL", "REMITTANCE - REFUND"].includes(item.reason.toUpperCase())
+      ? "PMTS" : item.reason;
+    const key = item.providerDetail ? JSON.stringify([item.date, item.settlement, item.direction, item.product, reason]) : item.row;
     const group = groups.get(key) ?? { ...item, reason, amount: 0, sourceRows: [] };
     if (group.status !== item.status) group.status = "Mixed · review";
     group.amount += item.amount;
@@ -334,27 +340,93 @@ function lendBatchMatches(days) {
   return matches;
 }
 
-function lendLineupBlocks({ dates, matches }, reverse) {
-  const byFed = new Map(matches.map(match => [match.fed, match]));
-  const matchedProvider = new Set(matches.map(match => match.provider));
-  const blocks = [];
+const lendDayGap = (a, b) => Math.abs(Date.parse(a) - Date.parse(b)) / 86400000;
+
+// Unique combination of two to four provider batches that totals the Fed amount, or undefined.
+function lendUniqueSubset(candidates, target) {
+  if (candidates.length > 40) return undefined;
+  let found, ambiguous = false;
+  (function search(start, remaining, selected) {
+    if (ambiguous) return;
+    if (remaining === 0 && selected.length >= 2) {
+      if (found) ambiguous = true;
+      else found = selected;
+      return;
+    }
+    if (selected.length === 4) return;
+    for (let i = start; i < candidates.length; i++) {
+      if (candidates[i].amount <= remaining) search(i + 1, remaining - candidates[i].amount, [...selected, candidates[i]]);
+    }
+  })(0, target, []);
+  return ambiguous ? undefined : found;
+}
+
+// Lines for the historical Amounts Lineup block: each line pairs Fed amounts with the LendKey batches they cover.
+function lendLineupLines({ dates, matches }, reverse) {
+  const byFed = new Map(matches.map(match => [match.fed, match.provider]));
+  const used = new Set(matches.map(match => match.provider));
+  const lines = [], pending = [];
   for (const day of dates) {
     for (const item of day.fedRows) {
-      const match = byFed.get(item);
-      if (match) blocks.push({ fed: [item], provider: [match.provider], note: "Exact batch match" });
-    }
-    const fed = day.fedRows.filter(item => !byFed.has(item));
-    const provider = day.achBatches.filter(item => !matchedProvider.has(item));
-    provider.push(...fed.filter(item => item.providerReview).map(item => ({
-      direction: reverse ? (item.direction === "Debit" ? "Credit" : "Debit") : item.direction,
-      comparison: item.comparison, reason: "Reviewed Fed item", status: item.providerReview, amount: item.amount,
-      periodDate: item.periodDate,
-    })));
-    if (fed.length || provider.length) {
-      blocks.push({ fed, provider, note: day.date + " " + day.direction + " subtotal" });
+      if (byFed.has(item)) lines.push({ fed: [item], provider: [byFed.get(item)] });
+      else if (item.providerReview) {
+        lines.push({ fed: [item], provider: [{
+          date: "", direction: reverse ? (item.direction === "Debit" ? "Credit" : "Debit") : item.direction,
+          comparison: item.comparison, product: item.providerProduct, reason: item.providerProduct ? "PMTS" : "",
+          note: item.providerReview, amount: item.amount,
+        }] });
+      } else if (item.amount) pending.push(item);
     }
   }
-  return blocks;
+  let open = dates.flatMap(day => day.achBatches.filter(item => item.amount && !used.has(item)));
+  const take = items => { open = open.filter(item => !items.includes(item)); };
+  // Remaining Fed and LendKey rows on the same comparison date and direction with equal totals.
+  for (const day of dates) {
+    const fed = pending.filter(item => item.periodDate === day.date && item.comparison === day.direction);
+    const provider = open.filter(item => item.periodDate === day.date && item.comparison === day.direction);
+    const total = items => items.reduce((sum, item) => sum + item.amount, 0);
+    if (!fed.length || !provider.length || total(fed) !== total(provider)) continue;
+    lines.push({ fed, provider });
+    fed.forEach(item => pending.splice(pending.indexOf(item), 1));
+    take(provider);
+  }
+  // One Fed amount covering a unique combination of LendKey batches within five days.
+  for (const item of [...pending]) {
+    const candidates = open.filter(batch => batch.comparison === item.comparison && lendDayGap(batch.periodDate, item.periodDate) <= 5);
+    const subset = lendUniqueSubset(candidates, item.amount);
+    if (!subset) continue;
+    lines.push({ fed: [item], provider: subset });
+    pending.splice(pending.indexOf(item), 1);
+    take(subset);
+  }
+  for (const batch of open) lines.push({ fed: [], provider: [batch], note: "No Fed match · review" });
+  for (const line of lines) {
+    line.fed.sort((a, b) => a.date.localeCompare(b.date));
+    line.provider.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  }
+  return { lines, unmatchedFed: pending };
+}
+
+// Historical order: debits (funding, then other activity, then rows without Fed), a blank row, then credits by product.
+function lendLineupSections(lines) {
+  const productRank = name => {
+    const index = lendProducts.findIndex(([, , aliases]) => aliases.includes(String(name ?? "").toUpperCase()));
+    return index < 0 ? lendProducts.length : index;
+  };
+  const lineDate = line => line.provider[0]?.date || line.fed[0]?.date || "";
+  const direction = line => (line.fed[0] ?? line.provider[0]).comparison;
+  const keys = {
+    Debit: line => [line.fed.length ? 0 : 1, String(line.provider[0]?.reason).toUpperCase() === "FUNDING" ? 0 : 1, lineDate(line)],
+    Credit: line => [line.fed.length ? 0 : 1, productRank(line.provider[0]?.product), lineDate(line)],
+  };
+  const compare = key => (a, b) => {
+    const left = key(a), right = key(b);
+    for (let i = 0; i < left.length; i++) {
+      if (left[i] !== right[i]) return typeof left[i] === "number" ? left[i] - right[i] : String(left[i]).localeCompare(String(right[i]));
+    }
+    return 0;
+  };
+  return ["Debit", "Credit"].map(name => lines.filter(line => direction(line) === name).sort(compare(keys[name])));
 }
 
 function lendClearingCandidate(items, target) {
@@ -580,48 +652,49 @@ async function buildLend(result) {
         ["Reviewed Fed items added to " + direction.toLowerCase(), (amounts.reviewedProvider ?? 0) / 100],
         [direction + " difference after review", (amounts.fed - amounts.ach - (amounts.reviewedProvider ?? 0)) / 100]);
     }
+    // Same block layout as the monthly workbook's Amounts Lineup, so rows 1 through the month-end date paste directly.
     const lineup = [
-      row(1, label("C1", "Amounts Lineup · " + result.month, 1)),
-      row(2, label("C2", "Grouped by Fed comparison date and direction. Review date totals and source rows before pasting.")),
-      row(5, label("C5", "Fed ACH transactions", 1) + label("L5", "LendKey ACH summary", 1)),
-      row(6, [["C", "Fed date"], ["E", "DR/CR"], ["H", "Amount"], ["J", "Fed reference"], ["K", "Difference"],
-        ["L", "Transaction date"], ["M", "Type"], ["N", "Product"], ["P", "Reason"], ["Q", "Status"], ["S", "Amount"],
-        ["T", "Comparison group"], ["V", "Provider comparison date"], ["W", "Provider on Fed basis"]]
-        .map(([col, title]) => label(col + "6", title, 1)).join("")),
+      row(1, label("C1", "ACH Transactions") + label("L1", "Lendkey Transactions")),
+      row(2, [["E", "DR/CR"], ["H", "Amount"], ["L", "Date"], ["M", "DR/CR"], ["P", "Description"], ["R", "Amount"]]
+        .map(([col, title]) => label(col + "2", title)).join("")),
     ];
-    let r = 7;
+    const text = (address, item) => item ? label(address, item) : "";
     const directionCode = direction => direction === "Debit" ? "DR" : "CR";
-    for (const block of lendLineupBlocks(result.ach, result.reverse)) {
-      const first = r, count = Math.max(block.fed.length, block.provider.length);
-      const difference = block.fed.reduce((sum, item) => sum + item.amount, 0)
-        - block.provider.reduce((sum, item) => sum + item.amount, 0);
-      for (let i = 0; i < count; i++) {
-        const left = block.fed[i], right = block.provider[i];
-        const fedCells = left ? date("C" + r, left.date) + label("E" + r, directionCode(left.comparison))
-          + number("H" + r, left.amount / 100) + label("J" + r, left.reference) : "";
-        const achCells = right ? date("L" + r, right.date) + label("M" + r, right.direction)
-          + label("N" + r, right.product) + label("P" + r, right.reason) + label("Q" + r, right.status)
-          + number("S" + r, right.amount / 100) : "";
-        const lastInBlock = i + 1 === count;
-        const check = lastInBlock ? formula("K" + r, `ROUND(SUM(H${first}:H${r})-SUM(S${first}:S${r}),2)`, difference) : "";
-        const group = lastInBlock ? label("T" + r, block.note) : "";
-        const basis = right ? date("V" + r, right.periodDate) + label("W" + r, directionCode(right.comparison)) : "";
-        lineup.push(row(r++, fedCells + check + achCells + group + basis));
+    const { lines, unmatchedFed } = lendLineupLines(result.ach, result.reverse);
+    let r = 3;
+    lendLineupSections(lines).forEach((section, index) => {
+      if (index && section.length) r++;
+      for (const line of section) {
+        const first = r, count = Math.max(line.fed.length, line.provider.length);
+        const difference = line.fed.reduce((sum, item) => sum + item.amount, 0)
+          - line.provider.reduce((sum, item) => sum + item.amount, 0);
+        for (let i = 0; i < count; i++) {
+          const left = line.fed[i], right = line.provider[i];
+          const fedCells = left ? label("E" + r, directionCode(left.comparison)) + number("H" + r, left.amount / 100) : "";
+          const check = i === 0 && line.fed.length
+            ? formula("K" + r, `ROUND(SUM(H${first}:H${first + count - 1})-SUM(S${first}:S${first + count - 1}),2)`, difference) : "";
+          const achCells = right ? (right.date ? date("L" + r, right.date) : "") + text("M" + r, right.direction)
+            + text("N" + r, right.product) + text("P" + r, right.reason) + number("S" + r, right.amount / 100)
+            + text("T" + r, right.note ?? (i === 0 ? line.note : "")) : "";
+          lineup.push(row(r++, fedCells + check + achCells));
+        }
       }
-    }
-    const last = r - 1;
-    if (last >= 7) {
+    });
+    const [year, monthNumber] = result.month.split("-").map(Number);
+    lineup.push(row(r, date("C" + r, new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10))));
+    const blockEnd = r;
+    if (unmatchedFed.length) {
+      r += 4;
+      lineup.push(row(r, label("C" + r, "Unmatched Fed items · review before pasting. Not part of the block above.", 1)));
       r++;
-      for (const [direction, amounts] of Object.entries(sums)) {
-        const code = directionCode(direction), provider = amounts.ach + (amounts.reviewedProvider ?? 0);
-        lineup.push(row(r, label("C" + r, direction + " total", 1)
-          + formula("H" + r, `SUMIF(E7:E${last},"${code}",H7:H${last})`, amounts.fed)
-          + formula("K" + r, `ROUND(H${r}-S${r},2)`, amounts.fed - provider)
-          + formula("S" + r, `SUMIF(W7:W${last},"${code}",S7:S${last})`, provider)));
+      for (const item of unmatchedFed) {
+        lineup.push(row(r, date("C" + r, item.date) + label("E" + r, directionCode(item.comparison)) + number("H" + r, item.amount / 100)
+          + text("J" + r, item.reference) + label("T" + r, "Fed row " + item.row)));
         r++;
       }
     }
-    sheets.push(["Amounts Lineup", worksheet("C1:W" + (r - 1), [[3, 23, 17]], lineup.join(""))]);
+    summary.push(["Amounts Lineup paste block", "C1:T" + blockEnd]);
+    sheets.push(["Amounts Lineup", worksheet("C1:T" + (unmatchedFed.length ? r - 1 : blockEnd), [[3, 20, 14]], lineup.join(""))]);
     sheets.push(table("ACH date review", ["Comparison date", "Direction", "Fed rows", "LendKey rows", "Fed amount", "LendKey amount", "Reviewed Fed items", "Difference after review", "Review"],
       dates.map(day => [day.date, day.direction, day.fedCount, day.achCount, day.fed / 100, day.ach / 100, (day.reviewedProvider ?? 0) / 100,
         (day.fed - day.ach - (day.reviewedProvider ?? 0)) / 100, day.sameDate ? "Date totals agree"

@@ -72,8 +72,8 @@
       <p>Paste the Fed worksheet row and the reason for excluding it from this reconciliation. The download keeps the row and reason in ACH source review.</p>
       <textarea id="fed-exclusions" rows="3" spellcheck="false" placeholder="Source row&#9;Reason"></textarea>
       <label for="fed-confirmed">Reviewed Fed items missing from provider export (optional)</label>
-      <p>For each confirmed item, paste the Fed worksheet row and the reason for including it in the reviewed provider total.</p>
-      <textarea id="fed-confirmed" rows="3" spellcheck="false" placeholder="Source row&#9;Reason"></textarea>
+      <p>For each confirmed item, paste the Fed worksheet row and the reason for including it in the reviewed provider total. Add the product (Consolidation, Home Improvement or Student) in a third column to fill it in on the Amounts Lineup row.</p>
+      <textarea id="fed-confirmed" rows="3" spellcheck="false" placeholder="Source row&#9;Reason&#9;Product"></textarea>
     </section>
     <section class="panel" aria-labelledby="purpose-heading">
       <h2 id="purpose-heading">Purpose Matchup and carryovers</h2>
@@ -113,7 +113,7 @@
       <p id="template-download-note" hidden>The filled copy keeps your workbook layout and formulas. It updates the source-backed statement and Wisdom inputs and the audit fields. Use the review download to copy the reviewed ACH and Purpose Matchup blocks.</p>
       <div id="summary" class="table"></div>
       <p>Review date and direction differences, prior-period rows, and statement variances before copying the draft values to your monthly workbook.</p>
-      <p>Copy the reviewed Amounts Lineup from C6 through column W and the Purpose Matchup from C3 through column K into blank monthly sections.</p>
+      <p>The Amounts Lineup sheet uses the monthly workbook's block layout. Copy from C1 through column T down to the month-end date and paste it below the previous month's block. Unmatched Fed items are listed separately below the block for review. Copy the reviewed Purpose Matchup from C3 through column K into a blank monthly section.</p>
     </section>
   </main>
 </body>
