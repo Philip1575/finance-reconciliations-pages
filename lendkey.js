@@ -334,6 +334,29 @@ function lendBatchMatches(days) {
   return matches;
 }
 
+function lendLineupBlocks({ dates, matches }, reverse) {
+  const byFed = new Map(matches.map(match => [match.fed, match]));
+  const matchedProvider = new Set(matches.map(match => match.provider));
+  const blocks = [];
+  for (const day of dates) {
+    for (const item of day.fedRows) {
+      const match = byFed.get(item);
+      if (match) blocks.push({ fed: [item], provider: [match.provider], note: "Exact batch match" });
+    }
+    const fed = day.fedRows.filter(item => !byFed.has(item));
+    const provider = day.achBatches.filter(item => !matchedProvider.has(item));
+    provider.push(...fed.filter(item => item.providerReview).map(item => ({
+      direction: reverse ? (item.direction === "Debit" ? "Credit" : "Debit") : item.direction,
+      comparison: item.comparison, reason: "Reviewed Fed item", status: item.providerReview, amount: item.amount,
+      periodDate: item.periodDate,
+    })));
+    if (fed.length || provider.length) {
+      blocks.push({ fed, provider, note: day.date + " " + day.direction + " subtotal" });
+    }
+  }
+  return blocks;
+}
+
 function lendClearingCandidate(items, target) {
   if (!target) return { status: target === 0 ? "No opening balance" : "Prior amount unavailable", items: [] };
   const eligible = items.filter(item => item.amount > 0 && item.amount <= target);
@@ -561,28 +584,44 @@ async function buildLend(result) {
       row(1, label("C1", "Amounts Lineup · " + result.month, 1)),
       row(2, label("C2", "Grouped by Fed comparison date and direction. Review date totals and source rows before pasting.")),
       row(5, label("C5", "Fed ACH transactions", 1) + label("L5", "LendKey ACH summary", 1)),
-      row(6, [["C", "Fed date"], ["E", "DR/CR"], ["H", "Amount"], ["J", "Fed reference"], ["L", "Transaction date"],
-        ["M", "Type"], ["N", "Product"], ["P", "Reason"], ["Q", "Status"], ["S", "Amount"], ["V", "Fed comparison date"]]
+      row(6, [["C", "Fed date"], ["E", "DR/CR"], ["H", "Amount"], ["J", "Fed reference"], ["K", "Difference"],
+        ["L", "Transaction date"], ["M", "Type"], ["N", "Product"], ["P", "Reason"], ["Q", "Status"], ["S", "Amount"],
+        ["T", "Comparison group"], ["V", "Provider comparison date"], ["W", "Provider on Fed basis"]]
         .map(([col, title]) => label(col + "6", title, 1)).join("")),
     ];
     let r = 7;
-    for (const day of dates) {
-      const providerGroups = [...day.achBatches, ...day.fedRows.filter(item => item.providerReview).map(item => ({
-        direction: result.reverse ? (item.direction === "Debit" ? "Credit" : "Debit") : item.direction,
-        reason: "Reviewed Fed item", status: item.providerReview, amount: item.amount,
-        settlement: item.date, periodDate: item.periodDate,
-      }))];
-      for (let i = 0; i < Math.max(day.fedCount, providerGroups.length); i++) {
-        const left = day.fedRows[i], right = providerGroups[i];
-        const fedCells = left ? date("C" + r, left.date) + label("E" + r, left.direction === "Debit" ? "DR" : "CR")
+    const directionCode = direction => direction === "Debit" ? "DR" : "CR";
+    for (const block of lendLineupBlocks(result.ach, result.reverse)) {
+      const first = r, count = Math.max(block.fed.length, block.provider.length);
+      const difference = block.fed.reduce((sum, item) => sum + item.amount, 0)
+        - block.provider.reduce((sum, item) => sum + item.amount, 0);
+      for (let i = 0; i < count; i++) {
+        const left = block.fed[i], right = block.provider[i];
+        const fedCells = left ? date("C" + r, left.date) + label("E" + r, directionCode(left.comparison))
           + number("H" + r, left.amount / 100) + label("J" + r, left.reference) : "";
         const achCells = right ? date("L" + r, right.date) + label("M" + r, right.direction)
           + label("N" + r, right.product) + label("P" + r, right.reason) + label("Q" + r, right.status)
-          + number("S" + r, right.amount / 100) + date("V" + r, right.settlement ? right.periodDate : "") : "";
-        lineup.push(row(r++, fedCells + achCells));
+          + number("S" + r, right.amount / 100) : "";
+        const lastInBlock = i + 1 === count;
+        const check = lastInBlock ? formula("K" + r, `ROUND(SUM(H${first}:H${r})-SUM(S${first}:S${r}),2)`, difference) : "";
+        const group = lastInBlock ? label("T" + r, block.note) : "";
+        const basis = right ? date("V" + r, right.periodDate) + label("W" + r, directionCode(right.comparison)) : "";
+        lineup.push(row(r++, fedCells + check + achCells + group + basis));
       }
     }
-    sheets.push(["Amounts Lineup", worksheet("C1:V" + (r - 1), [[3, 22, 16]], lineup.join(""))]);
+    const last = r - 1;
+    if (last >= 7) {
+      r++;
+      for (const [direction, amounts] of Object.entries(sums)) {
+        const code = directionCode(direction), provider = amounts.ach + (amounts.reviewedProvider ?? 0);
+        lineup.push(row(r, label("C" + r, direction + " total", 1)
+          + formula("H" + r, `SUMIF(E7:E${last},"${code}",H7:H${last})`, amounts.fed)
+          + formula("K" + r, `ROUND(H${r}-S${r},2)`, amounts.fed - provider)
+          + formula("S" + r, `SUMIF(W7:W${last},"${code}",S7:S${last})`, provider)));
+        r++;
+      }
+    }
+    sheets.push(["Amounts Lineup", worksheet("C1:W" + (r - 1), [[3, 23, 17]], lineup.join(""))]);
     sheets.push(table("ACH date review", ["Comparison date", "Direction", "Fed rows", "LendKey rows", "Fed amount", "LendKey amount", "Reviewed Fed items", "Difference after review", "Review"],
       dates.map(day => [day.date, day.direction, day.fedCount, day.achCount, day.fed / 100, day.ach / 100, (day.reviewedProvider ?? 0) / 100,
         (day.fed - day.ach - (day.reviewedProvider ?? 0)) / 100, day.sameDate ? "Date totals agree"
@@ -603,26 +642,27 @@ async function buildLend(result) {
       result.ach.matches.map(({ provider, fed, direction }) => [direction, provider.amount / 100, provider.settlement,
         provider.periodDate, fed.date, provider.sourceRows.join(", "), fed.row, fed.reference]), [16, 18, 21, 25, 17, 37, 13, 24]));
     const { groups, unknown } = result.purpose;
-    const headings = ["Date", "Tran Type", "Description", "Reason", "Amount", "Review note"];
-    const purposeRows = [row(3, headings.map((title, i) => label("BCDEFG"[i] + "3", title, 1)).join(""))];
+    const headings = [["C", "Date"], ["D", "Tran Type"], ["E", "Product"], ["G", "Reason"],
+      ["H", "Review note"], ["J", "Amount"], ["K", "Carryover type"]];
+    const purposeRows = [row(3, headings.map(([column, title]) => label(column + "3", title, 1)).join(""))];
     let purposeRow = 4;
     function writePurpose(entry) {
       purposeRows.push(row(purposeRow, entry.map((item, i) => {
-        const address = "BCDEFG"[i] + purposeRow;
+        const address = "CDEGHJK"[i] + purposeRow;
         return i === 0 ? date(address, item) : value(address, item);
       }).join("")));
       purposeRow++;
     }
-    const transaction = item => [item.date, item.direction, item.name, item.reason, item.amount / 100, item.clearing ?? item.purpose];
+    const transaction = item => [item.date, item.direction, item.name, item.reason, item.clearing ?? item.purpose, item.amount / 100];
     for (const { name, rows, inputs } of groups) {
       rows.forEach(item => writePurpose(transaction(item)));
-      for (const [key, type] of [["new-ar", "Acct Rec"], ["new-ap", "Acct Pay"]]) {
-        if (inputs[key]) writePurpose(["In Transit", type, "Performance Statement", "", inputs[key] / 100, name]);
+      for (const [key, type] of [["new-ar", "New A/R"], ["new-ap", "New A/P"]]) {
+        if (inputs[key]) writePurpose(["", "", name, "", "In transit · Performance Statement", inputs[key] / 100, type]);
       }
-      if (inputs["late-fees"]) writePurpose(["Late Fees", "", "Performance Statement", "Late Fees", inputs["late-fees"] / 100, name]);
+      if (inputs["late-fees"]) writePurpose(["", "", name, "Late Fees", "Performance Statement", inputs["late-fees"] / 100]);
     }
     unknown.forEach(item => writePurpose(transaction(item)));
-    sheets.push(["Purpose Matchup", worksheet("B3:G" + (purposeRow - 1), [[2, 3, 16], [4, 5, 24], [6, 6, 16], [7, 7, 32]], purposeRows.join(""))]);
+    sheets.push(["Purpose Matchup", worksheet("C3:K" + (purposeRow - 1), [[3, 4, 16], [5, 7, 24], [8, 8, 38], [10, 11, 17]], purposeRows.join(""))]);
     const dollar = amount => amount == null ? "" : amount / 100;
     sheets.push(table("Carryover review", ["Product", "Type", "Prior amount", "New statement amount", "Suggested ACH rows", "Status"],
       groups.flatMap(group => group.candidates.map(item => [group.name, item.type, dollar(item.target),
