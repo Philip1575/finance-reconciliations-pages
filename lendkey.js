@@ -210,8 +210,11 @@ async function lendAchRows(kind, from, through, reverse, overrides) {
       const sourceAmount = cents(get("amount"));
       const review = missingSettlement ? "Provider ACH date or direction missing" : "";
       const exclusion = text("exclude"), inRange = periodDate >= from && periodDate <= through;
+      // The standard provider report lists positive amounts with a separate direction, so a negative row is an
+      // adjustment within its batch and must reduce the batch total rather than add to it.
+      const amount = originalProviderColumns ? sourceAmount : Math.abs(sourceAmount);
       return {
-        kind, date, settlement, periodDate, direction, comparison, sourceAmount, amount: Math.abs(sourceAmount), row,
+        kind, date, settlement, periodDate, direction, comparison, sourceAmount, amount, row,
         override: override?.posting ?? "", providerDetail: Boolean(originalProviderColumns),
         product: text("product"), reason: text("reason"), status: text("status-col"), reference: text("reference"),
         financeProvider: text("finance-provider"),
@@ -291,10 +294,13 @@ function lendReviewMissingProvider(result, text) {
 function lendLineupGroups(items) {
   const groups = new Map();
   for (const item of items) {
-    // Provider remittances, reversals and refunds are all payment activity, recorded as PMTS on the monthly lineup.
-    const reason = item.providerDetail && ["REMITTANCE", "REMITTANCE - REVERSAL", "REMITTANCE - REFUND"].includes(item.reason.toUpperCase())
-      ? "PMTS" : item.reason;
-    const key = item.providerDetail ? JSON.stringify([item.date, item.settlement, item.direction, item.product, reason]) : item.row;
+    // Remittances, reversals and refunds on the same date form one payment batch. The monthly workbook labels Home
+    // Improvement batches Remittance or Remittance - Reversal and other products PMTS. Each funding is its own row.
+    const payment = item.providerDetail && ["REMITTANCE", "REMITTANCE - REVERSAL", "REMITTANCE - REFUND"].includes(item.reason.toUpperCase());
+    const reason = !payment ? item.reason
+      : lendProducts[0][2].includes(item.product.toUpperCase()) ? (item.direction === "Credit" ? "Remittance" : "Remittance - Reversal") : "PMTS";
+    const funding = ["FUNDING", "DISBURSEMENT"].includes(item.reason.toUpperCase());
+    const key = item.providerDetail && !funding ? JSON.stringify([item.date, item.settlement, item.direction, item.product, payment ? "PMTS" : reason]) : item.row;
     const group = groups.get(key) ?? { ...item, reason, amount: 0, sourceRows: [] };
     if (group.status !== item.status) group.status = "Mixed · review";
     group.amount += item.amount;
@@ -502,11 +508,15 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
   for (const code of ["CNL", "HIL", "STU"]) {
     const group = groups.get(code), cash = result.statementCash?.get(code) ?? new Map();
     const rows = items.filter(item => codeOf(item.product) === code).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
-    // The prior-period settlement on the statement identifies the batch that clears last month's A/R or A/P.
+    // The prior-period settlement on the statement identifies the batch that clears last month's A/R or A/P. The
+    // settlement can differ by cents from the batch (August 2026: 19,017.75 vs 19,017.38), so take the single
+    // closest payment batch within one dollar.
     const clearing = (target, direction) => {
       if (!target) return undefined;
-      const found = rows.filter(item => item.comparison === direction && upper(item.reason) !== "FUNDING" && item.amount === Math.abs(target));
-      return found.length === 1 ? found[0] : undefined;
+      const gap = item => Math.abs(item.amount - Math.abs(target));
+      const found = rows.filter(item => item.comparison === direction && upper(item.reason) !== "FUNDING" && gap(item) <= 100)
+        .sort((a, b) => gap(a) - gap(b));
+      return found.length && (found.length === 1 || gap(found[0]) < gap(found[1])) ? found[0] : undefined;
     };
     const arItem = clearing(cash.get("priorAR") ?? group?.inputs["prior-ar"], "Credit");
     const apItem = clearing(cash.get("priorAP") ?? group?.inputs["prior-ap"], "Debit");
