@@ -277,18 +277,53 @@ function lendReviewMissingProvider(result, text) {
   const unmatched = result.dates.flatMap(day => day.sameDate ? [] : day.fedRows
     .filter(item => item.amount && !matches.has(item)).map(item => ({ day, item })));
   const reviewed = lendReviewedFedRows(unmatched.map(entry => entry.item), text, true);
-  const byRow = new Map(unmatched.map(entry => [entry.item.row, entry.day]));
-  for (const { item, reason, product } of reviewed) {
-    item.providerReview = reason;
-    item.providerProduct = product;
-    const day = byRow.get(item.row);
-    day.reviewedProvider = (day.reviewedProvider ?? 0) + item.amount;
-    const sums = result.sums[item.comparison];
-    sums.reviewedProvider = (sums.reviewedProvider ?? 0) + item.amount;
-    requireReport(Number.isSafeInteger(sums.reviewedProvider + sums.ach), "The reviewed provider total exceeds the supported range.");
-    day.open--;
-  }
+  result.unmatchedDays = new Map(unmatched.map(entry => [entry.item, entry.day]));
+  for (const { item, reason, product } of reviewed) lendApplyProviderReview(result, item, reason, product);
   result.unmatchedFed = unmatched.map(entry => entry.item);
+}
+
+function lendApplyProviderReview(result, item, reason, product) {
+  item.providerReview = reason;
+  item.providerProduct = product;
+  const day = result.unmatchedDays.get(item);
+  day.reviewedProvider = (day.reviewedProvider ?? 0) + item.amount;
+  const sums = result.sums[item.comparison];
+  sums.reviewedProvider = (sums.reviewedProvider ?? 0) + item.amount;
+  requireReport(Number.isSafeInteger(sums.reviewedProvider + sums.ach), "The reviewed provider total exceeds the supported range.");
+  day.open--;
+}
+
+// The provider ACH export covers Home Improvement only, so Consolidation and Student payments appear only on the Fed.
+// Each statement's "Remittance to Lender" total identifies them: assign the single combination of unmatched Fed
+// credits (one to four) that equals a product's remittance. Rows the preparer already reviewed are left as entered.
+function lendAutoReviewProvider(result, statementCash) {
+  const assigned = [];
+  for (const [code, product] of [["CNL", "Consolidation"], ["STU", "Student"]]) {
+    const target = statementCash.get(code)?.get("remittance");
+    if (!target) continue;
+    const remittance = Math.abs(target);
+    const entered = result.unmatchedFed.filter(item => item.providerProduct === product).reduce((sum, item) => sum + item.amount, 0);
+    if (entered) continue;
+    const candidates = result.unmatchedFed.filter(item => !item.providerReview && item.comparison === "Credit" && item.amount > 0);
+    if (candidates.length > 40) continue;
+    let found, ambiguous = false;
+    (function search(start, remaining, selected) {
+      if (ambiguous) return;
+      if (remaining === 0 && selected.length) {
+        if (found) ambiguous = true;
+        else found = selected;
+        return;
+      }
+      if (selected.length === 4) return;
+      for (let i = start; i < candidates.length; i++) {
+        if (candidates[i].amount <= remaining) search(i + 1, remaining - candidates[i].amount, [...selected, candidates[i]]);
+      }
+    })(0, remittance, []);
+    if (!found || ambiguous) continue;
+    for (const item of found) lendApplyProviderReview(result, item, code + " statement remittance to lender · assigned automatically", product);
+    assigned.push(...found);
+  }
+  result.autoReviewed = assigned.length;
 }
 
 function lendLineupGroups(items) {
@@ -811,6 +846,7 @@ function showLend(result) {
     summary.push(["Exact batch matches across dates", result.ach.matches.filter(match => match.provider.periodDate !== match.fed.periodDate).length]);
     summary.push(["Rows outside selected dates", result.ach.outside.length]);
     summary.push(["Fed rows excluded for another month's LendKey date", result.ach.excluded.filter(item => item.autoExcluded).length]);
+    summary.push(["Fed credits assigned to Consolidation or Student from statement remittances", result.ach.autoReviewed ?? 0]);
     summary.push(["Rows excluded by reviewer", result.ach.excluded.filter(item => !item.autoExcluded).length]);
     if (result.ach.review.length) summary.push(["Rows with missing ACH settlement details", result.ach.review.length]);
     summary.push(["Prior carryovers with an exact candidate", result.purpose.groups.flatMap(group => group.candidates).filter(item => item.items.length).length]);
@@ -1126,6 +1162,7 @@ lendField("run").addEventListener("click", async () => {
       statements.set(product, fields);
       statementCash.set(product, cash);
     }
+    if (ach) lendAutoReviewProvider(ach, statementCash);
     const priorPurpose = lendSources.performance.book?.sheets.has("Purpose Matchup")
       ? lendPriorPurposeLabels(await readCells(lendSources.performance.book, "Purpose Matchup")) : undefined;
     if (wantsPerformance) {
