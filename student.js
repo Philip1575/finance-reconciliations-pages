@@ -524,10 +524,18 @@ async function buildStudent(result) {
       (item.calculated - item.statement) / 100, item.source]), [40, 20, 20, 18, 54]));
   sheets.push(...completionPasteSheets(result.cover?.completion, audit));
   if (!comparison) return createExcelWorkbook(sheets, audit);
+  const formula = (address, expression, amount) =>
+    `<c r="${address}" s="2"><f>${xmlText(expression)}</f><v>${amount / 100}</v></c>`;
+  const journalCells = (item, r) => journalRow(item).slice(0, 6).map((value, j) => {
+    const address = "ABCDEF"[j] + r;
+    if (j === 0) return date(address, value);
+    return typeof value === "number" ? number(address, value) : label(address, value);
+  }).join("");
   const matchup = [
-    row(1, label("A1", "Proposed groups · review before copying", 1)),
-    row(3, [...headers.slice(0, 6).map((title, i) => label("ABCDEF"[i] + "3", title, 1)),
-      label("G3", "Difference", 1), label("H3", "Fed money out", 1), label("J3", "Fed money in", 1)].join("")),
+    row(1, label("A1", "Student Choice MATCHUP · " + result.month, 1)),
+    row(3, [...["Date", "Amount", "Description", "Principal", "Interest", "Fees"]
+      .map((title, i) => label("ABCDEF"[i] + "3", title, 1)),
+      label("G3", "Difference", 1), label("H3", "FedRec Money Out", 1), label("J3", "FedRec Money In", 1)].join("")),
   ];
   let matchupRow = 4;
   for (const group of comparison.groups) {
@@ -540,15 +548,41 @@ async function buildStudent(result) {
     const expression = "ROUND(" + journalAmount + "-SUM(H" + first + ":H" + last + ")-SUM(J" + first + ":J" + last + "),2)";
     for (const item of group.journal) {
       const r = matchupRow++;
-      const journalCells = journalRow(item).slice(0, 6).map((value, j) => {
-        const address = "ABCDEF"[j] + r;
-        if (j === 0) return date(address, value);
-        return typeof value === "number" ? number(address, value) : label(address, value);
-      }).join("");
       const fed = r === last ? number((group.fed.cash < 0 ? "H" : "J") + r, -group.fed.cash / 100) : "";
-      const difference = r === last ? `<c r="G${r}" s="2"><f>${xmlText(expression)}</f><v>0</v></c>` : "";
-      matchup.push(row(r, journalCells + difference + fed));
+      const difference = r === last ? formula("G" + r, expression, 0) : "";
+      matchup.push(row(r, journalCells(item, r) + difference + fed));
     }
+    matchupRow++;
+  }
+  if (comparison.groups.length) {
+    const end = matchupRow - 2, r = matchupRow++;
+    const payments = [...comparison.matched.keys()].filter(item => item.payment);
+    const paymentTotal = (column, amount) => formula(column + r, ["PMT", "PMTR"].map(code =>
+      `SUMIF(C4:C${end},"${code}",${column}4:${column}${end})`).join("+"), amount);
+    const fedTotal = (column, sign) => formula(column + r, `SUM(${column}4:${column}${end})`,
+      comparison.groups.filter(group => Math.sign(group.fed.cash) === sign).reduce((total, group) => total - group.fed.cash, 0));
+    matchup.push(row(r, label("A" + r, "TOTALS", 1)
+      + paymentTotal("D", payments.reduce((total, item) => total + item.principal + item.capitalized, 0))
+      + paymentTotal("E", payments.reduce((total, item) => total + item.interest, 0))
+      + paymentTotal("F", payments.reduce((total, item) => total + item.fees, 0))
+      + fedTotal("H", -1) + fedTotal("J", 1)));
+  }
+  if (result.invoice?.match) {
+    const r = matchupRow++;
+    matchup.push(row(r, label("G" + r, "Billing invoice") + number("H" + r, -result.invoice.match.cash / 100)));
+  }
+  if (comparison.carry.length && !result.carryoverPending) {
+    matchupRow++;
+    matchup.push(row(matchupRow, label("A" + matchupRow, "Transit", 1)));
+    matchupRow++;
+    const first = matchupRow;
+    for (const item of comparison.carry) {
+      const r = matchupRow++;
+      matchup.push(row(r, journalCells(item, r)));
+    }
+    const r = matchupRow++;
+    matchup.push(row(r, label("A" + r, "TOTALS", 1) + [["D", comparison.principal], ["E", comparison.interest], ["F", comparison.fees]]
+      .map(([column, amount]) => formula(column + r, `SUM(${column}${first}:${column}${r - 1})`, amount)).join("")));
   }
   if (result.invoice) {
     const { candidates, review, date: expected } = result.invoice;
@@ -564,7 +598,7 @@ async function buildStudent(result) {
   }
   return createExcelWorkbook([
     ...sheets,
-    ["MATCHUP", worksheet("A1:J" + (matchupRow - 1), [[1, 10, 19]], matchup.join(""))],
+    ["MATCHUP", worksheet("A1:J" + Math.max(matchupRow - 1, 3), [[1, 10, 19]], matchup.join(""))],
     sheet("Journal review", [...headers, "Proposed group or review"], comparison.entries.map(item => [
       ...journalRow(item), comparison.matched.get(item) ?? comparison.review.get(item) ?? "Carryover candidate",
     ]), [...widths, 43]),
