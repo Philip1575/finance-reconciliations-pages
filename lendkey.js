@@ -810,7 +810,8 @@ function showLend(result) {
     summary.push(["Date and direction groups to review", result.ach.dates.filter(day => day.open).length]);
     summary.push(["Exact batch matches across dates", result.ach.matches.filter(match => match.provider.periodDate !== match.fed.periodDate).length]);
     summary.push(["Rows outside selected dates", result.ach.outside.length]);
-    summary.push(["Rows excluded by reviewer", result.ach.excluded.length]);
+    summary.push(["Fed rows excluded for another month's LendKey date", result.ach.excluded.filter(item => item.autoExcluded).length]);
+    summary.push(["Rows excluded by reviewer", result.ach.excluded.filter(item => !item.autoExcluded).length]);
     if (result.ach.review.length) summary.push(["Rows with missing ACH settlement details", result.ach.review.length]);
     summary.push(["Prior carryovers with an exact candidate", result.purpose.groups.flatMap(group => group.candidates).filter(item => item.items.length).length]);
   }
@@ -912,7 +913,8 @@ async function buildLend(result) {
     sheets.push(table("ACH source review", ["Source", "Row", "Transaction date", "Provider ACH date", "Type", "Compared as", "Product", "Reason", "Status", "Reference", "Source amount", "Selection", "Review reason", "Fed comparison date", "Confirmed Fed date", "Finance provider", "Wisdom posted on"],
       [...fed, ...ach, ...outside, ...excluded, ...review].map(item => [item.kind === "fed" ? "Fed" : "LendKey", item.row, item.date, item.settlement,
         item.direction, item.comparison, item.product, item.reason, item.status, item.reference, item.sourceAmount / 100,
-        item.included ? "Included" : !item.inRange ? "Outside selected dates" : item.exclusion ? "Excluded by reviewer" : "Review settlement",
+        item.included ? "Included" : !item.inRange ? "Outside selected dates"
+          : item.autoExcluded ? "Excluded automatically" : item.exclusion ? "Excluded by reviewer" : "Review settlement",
         [item.exclusion, item.review].filter(Boolean).join(" · "), item.periodDate, item.override, item.financeProvider, item.posted ?? ""]),
       [15, 10, 18, 18, 13, 15, 25, 24, 25, 19, 18, 24, 34, 20, 20, 24, 20]));
     if (result.ach.matches.length) sheets.push(table("ACH batch matches",
@@ -1089,6 +1091,19 @@ lendField("run").addEventListener("click", async () => {
       const [provider, fed] = await Promise.all([lendAchRows("ach", from, through, direction === "reverse", overrides), lendAchRows("fed", from, through, false)]);
       const unused = [...overrides.values()].find(item => !item.used);
       requireReport(!unused, unused && "No LendKey ACH rows match the override for " + unused.date + " " + unused.type + ".");
+      // Each LendKey Fed entry ends with its LendKey date (",073126" = 7/31/26). An entry that settles in the window but
+      // carries another month's date belongs to that month's reconciliation, so it is excluded here automatically.
+      for (const item of fed) {
+        if (!item.inRange || item.exclusion) continue;
+        const reference = /,\s*(\d{2})(\d{2})(\d{2})(?!\d)/.exec(item.reference ?? "");
+        if (!reference) continue;
+        const [, mm, dd, yy] = reference;
+        const lendKeyDate = "20" + yy + "-" + mm + "-" + dd;
+        if (Number.isNaN(Date.parse(lendKeyDate + "T00:00:00Z")) || lendKeyDate.slice(0, 7) === month) continue;
+        item.exclusion = (lendKeyDate < month ? "Prior" : "Next") + " month LendKey reference " + mm + "/" + dd + "/" + yy + " · excluded automatically";
+        item.autoExcluded = true;
+        item.included = false;
+      }
       for (const { item, reason } of lendReviewedFedRows(fed.filter(item => item.inRange && !item.exclusion), lendField("fed-exclusions").value)) {
         item.exclusion = reason;
         item.included = false;

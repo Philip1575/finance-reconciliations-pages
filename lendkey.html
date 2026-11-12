@@ -69,7 +69,7 @@
       <p>To use a confirmed posting date in the daily totals, paste the ACH date, ACH direction as reported by LendKey, and Fed posting date. Review carryovers and adjust the date range as needed.</p>
       <textarea id="posting-dates" rows="3" spellcheck="false" placeholder="ACH date&#9;ACH direction&#9;Fed posting date"></textarea>
       <label for="fed-exclusions">Reviewed Fed exclusions (optional)</label>
-      <p>Paste the Fed worksheet row and the reason for excluding it from this reconciliation. The download keeps the row and reason in ACH source review.</p>
+      <p>Fed entries whose LendKey date falls in another month (for example ,073126 on an August 3 settlement) are excluded automatically and listed in ACH source review. Use this box only for anything else: paste the Fed worksheet row and the reason for excluding it.</p>
       <textarea id="fed-exclusions" rows="3" spellcheck="false" placeholder="Source row&#9;Reason"></textarea>
       <label for="fed-confirmed">Reviewed Fed items missing from provider export (optional)</label>
       <p>For each confirmed item, paste the Fed worksheet row and the reason for including it in the reviewed provider total. Add the product (Consolidation, Home Improvement or Student) in a third column to fill it in on the Amounts Lineup row.</p>
