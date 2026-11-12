@@ -28,6 +28,26 @@ const lendHomePdfFields = [
   ],
 ];
 
+// Cash-section lines used by the monthly Purpose Matchup: settlements, remittances and in-transit balances.
+const lendPdfCashLines = {
+  HIL: [["priorAR", "Prior AR Settlement"], ["priorAP", "Prior AP Settlement"], ["remittance", "PMT Remittance"],
+    ["reversal", "PMT Remittance Reversal"], ["newAR", "Accounts Receivable (To Lender)"], ["newAP", "Accounts Payable (From Lender)"]],
+  other: [["remittance", "Remittance to Lender"], ["newAR", "Accounts Receivable (to Lender)"], ["newAP", "Accounts Payable (from Lender)"]],
+};
+
+function lendPdfCash(items, product) {
+  const cash = new Map();
+  for (const [key, label] of lendPdfCashLines[product === "HIL" ? "HIL" : "other"]) {
+    const labels = items.filter(item => item.text.trim().toLowerCase() === label.toLowerCase());
+    if (labels.length !== 1) continue;
+    const [line] = labels;
+    const [amount] = items.filter(item => item.x > line.x && Math.abs(item.y - line.y) < 2.5 && Number.isFinite(readBalance(item.text)))
+      .sort((a, b) => a.x - b.x);
+    if (amount) cash.set(key, cents(amount.text));
+  }
+  return cash;
+}
+
 function lendPdfSection(items, start, end) {
   const section = items.filter(item => item.x >= start - 1 && item.x < end - 1);
   return (selector, occurrence) => {
@@ -73,7 +93,7 @@ async function readLendStatementPdf(file, month) {
       }
       return [schedule.name, values];
     }));
-    return { product, fields };
+    return { product, fields, cash: lendPdfCash(text, product) };
   } catch (error) {
     throw new Error(file.name + ": " + error.message);
   }

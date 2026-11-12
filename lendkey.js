@@ -429,6 +429,144 @@ function lendLineupSections(lines) {
   return ["Debit", "Credit"].map(name => lines.filter(line => direction(line) === name).sort(compare(keys[name])));
 }
 
+// Static summary text (journal entries and account notes) from the last Purpose Matchup block in the prepared workbook.
+function lendPriorPurposeLabels(cells) {
+  let start;
+  for (const [address, value] of cells) {
+    const match = /^C(\d+)$/.exec(address);
+    if (match && String(value ?? "").trim().toUpperCase() === "A/R CLEARED") start = Math.max(start ?? 0, Number(match[1]));
+  }
+  if (!start) return undefined;
+  return [0, 1, 2, 3, 4].map(offset => new Map(["E", "G", "H", "I", "K", "M"].flatMap(column => {
+    const value = cells.get(column + (start + offset));
+    return value === undefined || value === "" ? [] : [[column, value]];
+  })));
+}
+
+// The monthly Purpose Matchup block: month-end date, then Consolidation, Home Improvement and Student sections, then the summary.
+function lendPurposeBlock(result, lines, { label, number, date, formula }) {
+  const grid = new Map();
+  const put = (r, column, xml) => {
+    if (!grid.has(r)) grid.set(r, new Map());
+    grid.get(r).set(column, xml);
+  };
+  const text = (r, column, value) => {
+    if (value !== undefined && value !== null && value !== "") put(r, column, typeof value === "number" ? number(column + r, value) : label(column + r, value));
+  };
+  const money = (r, column, amount) => { if (amount != null) put(r, column, number(column + r, amount / 100)); };
+  const total = items => items.reduce((sum, item) => sum + item.amount, 0);
+  const upper = value => String(value ?? "").toUpperCase();
+  const codeOf = name => lendProducts.find(([, , aliases]) => aliases.includes(upper(name)))?.[0];
+  const range = (column, rows) => rows.length ? `${column}${rows[0]}:${column}${rows.at(-1)}` : "";
+  const [year, monthNumber] = result.month.split("-").map(Number);
+  put(1, "C", date("C1", new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10)));
+  const items = lines.flatMap(line => line.provider);
+  const groups = new Map(result.purpose.groups.map(group => [group.code, group]));
+  const cleared = { ar: 0, ap: 0 }, inTransit = { ar: [], ap: [] };
+  let r = 2;
+  for (const code of ["CNL", "HIL", "STU"]) {
+    const group = groups.get(code), cash = result.statementCash?.get(code) ?? new Map();
+    const rows = items.filter(item => codeOf(item.product) === code).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+    // The prior-period settlement on the statement identifies the batch that clears last month's A/R or A/P.
+    const clearing = (target, direction) => {
+      if (!target) return undefined;
+      const found = rows.filter(item => item.comparison === direction && upper(item.reason) !== "FUNDING" && item.amount === Math.abs(target));
+      return found.length === 1 ? found[0] : undefined;
+    };
+    const arItem = clearing(cash.get("priorAR") ?? group?.inputs["prior-ar"], "Credit");
+    const apItem = clearing(cash.get("priorAP") ?? group?.inputs["prior-ap"], "Debit");
+    const rest = rows.filter(item => item !== arItem && item !== apItem);
+    const funding = rest.filter(item => item.comparison === "Debit" && upper(item.reason) === "FUNDING");
+    const otherDebits = rest.filter(item => item.comparison === "Debit" && !funding.includes(item));
+    const credits = rest.filter(item => item.comparison !== "Debit");
+    const write = (item, note) => {
+      if (item.date) put(r, "C", date("C" + r, item.date));
+      text(r, "D", item.direction);
+      text(r, "E", item.product);
+      text(r, "G", item.reason);
+      money(r, "J", item.amount);
+      text(r, "K", note);
+      return r++;
+    };
+    if (arItem) { write(arItem, "Cleared"); cleared.ar += arItem.amount; }
+    const fundingRows = funding.map(item => write(item));
+    const apRow = apItem ? write(apItem, "Cleared") : undefined;
+    if (apItem) cleared.ap += apItem.amount;
+    const otherRows = otherDebits.map(item => write(item));
+    const creditRows = credits.map(item => write(item));
+    const newAR = cash.get("newAR") ?? (group?.inputs["new-ar"] == null ? undefined : -group.inputs["new-ar"]);
+    const newAP = cash.get("newAP") ?? group?.inputs["new-ap"] ?? undefined;
+    const arRow = r++, apTransitRow = r++;
+    text(arRow, "H", "A/R in Transit");
+    money(arRow, "J", newAR);
+    text(arRow, "K", "NEW A/R");
+    text(apTransitRow, "H", "A/P in Transit");
+    money(apTransitRow, "J", newAP);
+    text(apTransitRow, "K", "NEW A/P");
+    inTransit.ar.push([arRow, newAR ?? 0]);
+    inTransit.ap.push([apTransitRow, newAP ?? 0]);
+    // Remittance tie-out: transactions in the section against the statement's remittance line.
+    const remittance = cash.has("remittance") ? Math.abs(cash.get("remittance")) : undefined;
+    const remitted = total(credits);
+    text(arRow, "L", code === "HIL" ? "PMT REMITTANCE" : code === "CNL" ? "remittance to lender" : "");
+    text(arRow, "N", "PDF");
+    text(apTransitRow, "L", "TOTAL");
+    put(apTransitRow, "M", creditRows.length ? formula("M" + apTransitRow, `SUM(${range("J", creditRows)})`, remitted) : number("M" + apTransitRow, 0));
+    money(apTransitRow, "N", remittance);
+    if (code !== "STU" && remittance !== undefined) {
+      put(r, "M", formula("M" + r, `ROUND(M${apTransitRow}-N${apTransitRow},2)`, remitted - remittance));
+      if (code === "CNL") r++;
+    }
+    if (code !== "HIL") continue;
+    // Funding tie-out against statement disbursements.
+    if (fundingRows.length >= 5) {
+      const [, , third, fourth, fifth] = fundingRows;
+      const disbursed = lendStatementInput(result.statements, result.portfolio, "HIL", "Loan Principal Recs", 9)?.amount ?? group?.statementFunding;
+      const funded = total(funding);
+      put(third, "M", formula("M" + third, `K${fifth}-L${fifth}`, disbursed == null ? funded : funded - disbursed));
+      text(fourth, "K", "Funding:");
+      text(fourth, "L", "Disbursed:");
+      put(fifth, "K", formula("K" + fifth, `SUM(${range("J", fundingRows)})`, funded));
+      money(fifth, "L", disbursed);
+    }
+    // Reversal tie-out: payment reversals after the cleared A/P against the statement's remittance reversal line.
+    const reversalStart = apRow ?? otherRows[0];
+    if (fundingRows.length && reversalStart) {
+      const reversal = cash.has("reversal") ? Math.abs(cash.get("reversal")) : undefined;
+      const reversed = total(otherDebits);
+      if (fundingRows.length !== 5) {
+        text(fundingRows.at(-1), "L", "PMT REMITTANCE REVERSAL");
+        text(fundingRows.at(-1), "N", "PDF");
+      }
+      text(reversalStart, "L", "TOTAL");
+      put(reversalStart, "M", otherRows.length ? formula("M" + reversalStart, `SUM(${range("J", otherRows)})`, reversed) : number("M" + reversalStart, 0));
+      money(reversalStart, "N", reversal);
+      if (reversal !== undefined) {
+        put(reversalStart + 1, "M", formula("M" + (reversalStart + 1), `ROUND(M${reversalStart}-N${reversalStart},2)`, reversed - reversal));
+      }
+    }
+  }
+  const s = r, prior = result.priorPurpose;
+  const defaults = [
+    new Map([["H", "DEBIT"], ["I", "CREDIT"], ["K", "LATE FEES+REVERSALS"]]), new Map([["G", "A/R Cleared"], ["K", "HIL"]]),
+    new Map([["G", "A/P Cleared"], ["K", "CNL"]]), new Map([["G", "Late Fees"], ["K", "PSL"]]), new Map([["G", "New A/R"]]),
+  ];
+  ["A/R CLEARED", "A/P CLEARED", "LATE FEES", "NEW A/R", "NEW A/P"].forEach((title, i) => {
+    text(s + i, "C", title);
+    for (const [column, value] of prior?.[i] ?? defaults[i]) text(s + i, column, value);
+  });
+  money(s, "D", cleared.ar);
+  money(s + 1, "D", cleared.ap);
+  const lateFees = ["HIL", "CNL", "STU"].map(code => groups.get(code)?.inputs["late-fees"] ?? 0);
+  lateFees.forEach((amount, i) => money(s + 1 + i, "L", amount));
+  put(s + 2, "D", formula("D" + (s + 2), `SUM(L${s + 1}:L${s + 3})`, lateFees.reduce((sum, amount) => sum + (amount ?? 0), 0)));
+  for (const [offset, entries] of [[3, inTransit.ar], [4, inTransit.ap]]) {
+    put(s + offset, "D", formula("D" + (s + offset), `SUM(${entries.map(([row]) => "J" + row).join(",")})`,
+      entries.reduce((sum, [, amount]) => sum + amount, 0)));
+  }
+  return { grid, last: s + 4 };
+}
+
 function lendClearingCandidate(items, target) {
   if (!target) return { status: target === 0 ? "No opening balance" : "Prior amount unavailable", items: [] };
   const eligible = items.filter(item => item.amount > 0 && item.amount <= target);
@@ -715,27 +853,12 @@ async function buildLend(result) {
       result.ach.matches.map(({ provider, fed, direction }) => [direction, provider.amount / 100, provider.settlement,
         provider.periodDate, fed.date, provider.sourceRows.join(", "), fed.row, fed.reference]), [16, 18, 21, 25, 17, 37, 13, 24]));
     const { groups, unknown } = result.purpose;
-    const headings = [["C", "Date"], ["D", "Tran Type"], ["E", "Product"], ["G", "Reason"],
-      ["H", "Review note"], ["J", "Amount"], ["K", "Carryover type"]];
-    const purposeRows = [row(3, headings.map(([column, title]) => label(column + "3", title, 1)).join(""))];
-    let purposeRow = 4;
-    function writePurpose(entry) {
-      purposeRows.push(row(purposeRow, entry.map((item, i) => {
-        const address = "CDEGHJK"[i] + purposeRow;
-        return i === 0 ? date(address, item) : value(address, item);
-      }).join("")));
-      purposeRow++;
-    }
-    const transaction = item => [item.date, item.direction, item.name, item.reason, item.clearing ?? item.purpose, item.amount / 100];
-    for (const { name, rows, inputs } of groups) {
-      rows.forEach(item => writePurpose(transaction(item)));
-      for (const [key, type] of [["new-ar", "New A/R"], ["new-ap", "New A/P"]]) {
-        if (inputs[key]) writePurpose(["", "", name, "", "In transit · Performance Statement", inputs[key] / 100, type]);
-      }
-      if (inputs["late-fees"]) writePurpose(["", "", name, "Late Fees", "Performance Statement", inputs["late-fees"] / 100]);
-    }
-    unknown.forEach(item => writePurpose(transaction(item)));
-    sheets.push(["Purpose Matchup", worksheet("C3:K" + (purposeRow - 1), [[3, 4, 16], [5, 7, 24], [8, 8, 38], [10, 11, 17]], purposeRows.join(""))]);
+    // Same block layout as the monthly workbook's Purpose Matchup: batch-level rows by product with the statement tie-outs.
+    const purposeBlock = lendPurposeBlock(result, lines, { label, number, date, formula });
+    const purposeRows = [...purposeBlock.grid].sort((a, b) => a[0] - b[0]).map(([r, cells]) =>
+      row(r, [...cells].sort((a, b) => columnNumber(a[0]) - columnNumber(b[0])).map(([, xml]) => xml).join("")));
+    summary.push(["Purpose Matchup paste block", "C1:N" + purposeBlock.last]);
+    sheets.push(["Purpose Matchup", worksheet("C1:N" + purposeBlock.last, [[3, 4, 14], [5, 5, 18], [6, 7, 14], [8, 8, 16], [9, 14, 14]], purposeRows.join(""))]);
     const dollar = amount => amount == null ? "" : amount / 100;
     sheets.push(table("Carryover review", ["Product", "Type", "Prior amount", "New statement amount", "Suggested ACH rows", "Status"],
       groups.flatMap(group => group.candidates.map(item => [group.name, item.type, dollar(item.target),
@@ -910,12 +1033,16 @@ lendField("run").addEventListener("click", async () => {
       portfolio = await readLendPortfolio(portfolioSource.book, month);
     }
     if (current !== lendRevision) return;
+    const statementCash = new Map();
     for (const file of pdfFiles) {
-      const { product, fields } = await readLendStatementPdf(file, month);
+      const { product, fields, cash } = await readLendStatementPdf(file, month);
       if (current !== lendRevision) return;
       requireReport(!statements.has(product), "More than one PDF was selected for " + product + ".");
       statements.set(product, fields);
+      statementCash.set(product, cash);
     }
+    const priorPurpose = lendSources.performance.book?.sheets.has("Purpose Matchup")
+      ? lendPriorPurposeLabels(await readCells(lendSources.performance.book, "Purpose Matchup")) : undefined;
     if (wantsPerformance) {
       requireReport(lendSources.performance.book, "Load a readable performance workbook.");
       const book = lendSources.performance.book;
@@ -936,6 +1063,7 @@ lendField("run").addEventListener("click", async () => {
     const purpose = ach ? buildLendPurpose(ach, performance) : undefined;
     const template = lendSources.performance.file;
     lendResult = { month, from, through, reverse: direction === "reverse", ach, performance, cover, purpose, portfolio, completion, statements, template,
+      statementCash, priorPurpose,
       portfolioFile: portfolioSource?.file?.name,
       achFile: lendSources.ach.file?.name, fedFile: lendSources.fed.file?.name, performanceFile: lendSources.performance.file?.name,
       wisdomFile: lendSources.wisdom.file?.name };
