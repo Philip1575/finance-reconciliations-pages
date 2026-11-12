@@ -60,6 +60,8 @@
       <p>Optional. Use both exports and a prepared daily workbook with its VIZO MATCHUP tab. Earlier amounts can come from the reviewed template when the export does not cover their date.</p>
       <div class="drop" id="vizo-drop"><label for="vizo-file">VIZO settlement activity</label><input id="vizo-file" type="file" accept=".xlsx,.xlsm,.csv"></div>
       <p id="vizo-status" role="status"></p>
+      <div class="drop" id="vizo-cutoff-drop"><label for="vizo-cutoff-file">Optional VIZO settlement CSV with later activity</label><input id="vizo-cutoff-file" type="file" accept=".csv"></div>
+      <p id="vizo-cutoff-status" role="status"></p>
       <div class="drop" id="settlement-drop"><label for="settlement-file">Wisdom settlement G/L history</label><input id="settlement-file" type="file" accept=".xlsx,.xlsm,.csv"></div>
       <p id="settlement-status" role="status"></p>
       <label>Wisdom settlement amount sign<select id="settlement-sign"><option value="1">Use the imported sign</option><option value="-1">Reverse the imported sign</option></select></label>

@@ -8,6 +8,7 @@ let dailyBatchAssignments = new Map();
 const dailyRoles = [
   ["statement", "Fed Statement of Account"], ["ledger", "Fed Wisdom G/L History"],
   ["template", "Prepared Fed Rec with Ops inputs"], ["vizo", "VIZO Settlement activity"],
+  ["vizo-cutoff", "Later VIZO Settlement activity for cutoff review"],
   ["settlement", "Wisdom Settlement G/L History"], ["refresh-ledger", "Refreshed Fed Wisdom history"],
   ["sent-current", "Current day Sent Files Summary"], ["sent-prior", "Prior day Sent Files Summary"],
   ["returns-current", "Current day Report 174"], ["returns-prior", "Prior day Report 174"],
@@ -91,6 +92,19 @@ async function selectDailyBatch(files) {
   message.textContent = files.length ? "Checking file types…" : "";
   const date = fedField("date").value;
   const suggested = await Promise.all(files.map(async file => ({ file, role: await suggestDailyRole(file, date).catch(() => "") })));
+  const vizo = suggested.filter(entry => entry.role === "vizo");
+  if (date && vizo.length === 2) {
+    const periods = await Promise.all(vizo.map(async ({ file }) => {
+      try {
+        const report = vizoNativeProvider(readCsvCells(await file.text()));
+        return [report.rows[0].date, report.rows.at(-1).date];
+      } catch {
+        return [];
+      }
+    }));
+    const primary = periods.findIndex(([first, last]) => first <= date && last === date);
+    if (primary >= 0 && periods[1 - primary][1] > date) vizo[1 - primary].role = "vizo-cutoff";
+  }
   if (current !== dailyBatchRevision || !suggested.length) return;
   const counts = new Map();
   for (const { role } of suggested) counts.set(role, (counts.get(role) ?? 0) + 1);
@@ -650,9 +664,9 @@ function fedDepositCandidates(items, wisdom) {
   return items.flatMap(item => [...byDate].flatMap(([ledgerDate, { branch, mobile, branchRows, mobileRows }]) => {
     if (ledgerDate > item.date || ledgerDate < dateOffset(item.date, -4)) return [];
     const candidates = [];
-    if (branch === item.amount) candidates.push([branch, 0, branchRows]);
-    if (mobile === item.amount) candidates.push([0, mobile, mobileRows]);
-    if (branch > 0 && mobile > 0 && branch + mobile === item.amount) {
+    if (item.category !== "Mobile deposits" && branch === item.amount) candidates.push([branch, 0, branchRows]);
+    if (item.category !== "Branch deposits" && mobile === item.amount) candidates.push([0, mobile, mobileRows]);
+    if (item.category === "Unclassified forward collection" && branch > 0 && mobile > 0 && branch + mobile === item.amount) {
       candidates.push([branch, mobile, [...branchRows, ...mobileRows]]);
     }
     return candidates.map(([branchAmount, mobileAmount, rows]) => ({ item, ledgerDate, branchAmount, mobileAmount, rows }));
@@ -698,10 +712,25 @@ async function reconcileVizo(date, template, sign, reviewedDeposits) {
   }
   const dates = new Set([date, ...references.flatMap(item => [item.wisdomDate, item.vizoDate]).filter(Boolean)]);
   const wisdomDates = new Set([...dates, ...[-1, -2, -3, -4].map(offset => dateOffset(date, offset))]);
-  const [vizo, wisdom] = await Promise.all([
-    readDailySource(dailyFiles.vizo, dates, "vizo", 1),
+  const lookahead = [1, 2, 3, 4].map(offset => dateOffset(date, offset));
+  const cutoffFile = dailyFiles["vizo-cutoff"];
+  const primaryFile = dailyFiles.vizo;
+  const [vizo, wisdom, later] = await Promise.all([
+    readDailySource(primaryFile, new Set([...dates, ...lookahead]), "vizo", 1),
     readDailySource(dailyFiles.settlement, wisdomDates, "settlement", sign),
+    cutoffFile ? (async () => {
+      requireReport(/\.csv$/i.test(primaryFile.name) && primaryFile.size <= 20 * 1024 * 1024,
+        "Use the original VIZO Settlement CSV with a separate cutoff file.");
+      const primary = vizoNativeProvider(readCsvCells(await primaryFile.text()));
+      return readVizoBoundary(cutoffFile, primary, date, lookahead.at(-1));
+    })() : [],
   ]);
+  for (const item of later) {
+    vizo.push({ ...item, source: "vizo", name: cutoffFile.name, raw: item.amount, category: settlementCategory(item.description) });
+  }
+  const cutoffRows = vizo.filter(item => item.date > date && item.amount > 0
+    && ["Branch deposits", "Mobile deposits", "Unclassified forward collection"].includes(item.category));
+  const cutoffCandidates = fedDepositCandidates(cutoffRows, wisdom.filter(item => item.date === date));
   const unclassified = vizo.filter(item => item.date === date && item.amount > 0 && item.category === "Unclassified forward collection");
   const allocations = readReviewedDepositAllocations(reviewedDeposits, unclassified,
     new Set(wisdom.filter(item => item.date <= date).map(item => item.date)));
@@ -761,8 +790,8 @@ async function reconcileVizo(date, template, sign, reviewedDeposits) {
         : difference == null ? "Pending source or template review" : difference ? "Difference to review" : "Amounts agree";
     return { ...item, provider, ledger, difference, review };
   });
-  return { comparisons, paste, allocations, depositCandidates, sources: [...vizo, ...wisdom],
-    vizoFile: dailyFiles.vizo.name, wisdomFile: dailyFiles.settlement.name };
+  return { comparisons, paste, allocations, depositCandidates, cutoffCandidates, sources: [...vizo, ...wisdom],
+    vizoFile: primaryFile.name, cutoffFile: cutoffFile?.name, wisdomFile: dailyFiles.settlement.name };
 }
 
 function compareDaily(statement, ledger, template, finance, effectiveDateHistory) {
@@ -842,6 +871,7 @@ function dailySummary(result) {
   if (result.clearing) details.push(["Cover difference after proposed clearing", cash.format(result.clearing.difference / 100)],
     ["Provider clearing check", result.clearing.issues.join(" ") || "Balances agree · see Cover clearing review"]);
   if (result.vizo) details.push(["VIZO comparisons requiring review", result.vizo.comparisons.filter(item => item.review !== "Amounts agree").length]);
+  if (result.vizo?.cutoffCandidates.length) details.push(["VIZO deposit cutoff candidates", result.vizo.cutoffCandidates.length]);
   for (const [name, value] of details) {
     const row = body.insertRow(), heading = document.createElement("th");
     heading.scope = "row";
@@ -912,6 +942,7 @@ async function buildDaily(result) {
       ["Next-day finance debits", result.finance.debits / 100], ["Next-day finance credits", result.finance.credits / 100],
       ["Finance timing coverage", result.finance.covered ? "Posting date found in Wisdom export" : "Posting date missing from Wisdom export · verify"],
       ...(result.vizo ? [["VIZO settlement source", result.vizo.vizoFile], ["Wisdom settlement source", result.vizo.wisdomFile]] : []),
+      ...(result.vizo?.cutoffFile ? [["VIZO cutoff source", result.vizo.cutoffFile]] : []),
     ], [40, 60]),
     table("Wire and FedNow", ["Category", "Statement", "Wisdom", "Workbook difference"],
       result.comparisons.map(entry => [entry.category, entry.statement / 100, entry.ledger / 100, entry.difference / 100]), [18, 19, 19, 23]),
@@ -998,6 +1029,11 @@ async function buildDaily(result) {
     if (result.vizo.allocations.length) sheets.push(table("Reviewed deposit allocations",
       [...allocationColumns, "Provider total"],
       result.vizo.allocations.map(entry => [...allocationValues(entry), entry.item.amount / 100]), [16, 17, 17, 17, 17]));
+    if (result.vizo.cutoffCandidates.length) sheets.push(table("Deposit cutoff review",
+      ["VIZO date", "VIZO source", "VIZO row", "Wisdom date", "Wisdom rows", "Branch amount", "Mobile amount", "Review"],
+      result.vizo.cutoffCandidates.map(entry => [entry.item.date, entry.item.name === "CSV" ? result.vizo.vizoFile : entry.item.name,
+        entry.item.row, entry.ledgerDate, entry.rows.join(", "), entry.branchAmount / 100, entry.mobileAmount / 100,
+        "Verify that the later VIZO deposit clears this day's Wisdom amount." ]), [16, 34, 12, 16, 18, 18, 18, 64]));
     const issues = result.vizo.comparisons.filter(item => item.review !== "Amounts agree" &&
       ["Share drafts", "Share draft suspense", "Returned deposits"].includes(item.category));
     sheets.push(table("Clearing review", ["Category", "VIZO date", "Wisdom date", "VIZO amount", "Wisdom amount",
@@ -1008,7 +1044,7 @@ async function buildDaily(result) {
   return createExcelWorkbook(sheets, audit);
 }
 
-for (const kind of ["statement", "ledger", "template", "vizo", "settlement", "refresh-ledger", "sent-current", "sent-prior", "returns-current", "returns-prior"]) {
+for (const kind of ["statement", "ledger", "template", "vizo", "vizo-cutoff", "settlement", "refresh-ledger", "sent-current", "sent-prior", "returns-current", "returns-prior"]) {
   const input = fedField(kind + "-file"), drop = fedField(kind + "-drop");
   input.addEventListener("change", () => selectDaily(kind, input.files[0]));
   drop.addEventListener("dragover", event => { event.preventDefault(); drop.classList.add("active"); });
@@ -1041,7 +1077,7 @@ fedField("run").addEventListener("click", async () => {
     const postingDate = fedField("finance-posting-date").value || nextFedPostingDate(date);
     requireReport(postingDate > date, "Choose the next Finance effective date after the statement date.");
     requireReport(dailyFiles.statement && dailyFiles.ledger, "Load the statement and Wisdom G/L History.");
-    const wantsVizo = dailyFiles.vizo || dailyFiles.settlement;
+    const wantsVizo = dailyFiles.vizo || dailyFiles.settlement || dailyFiles["vizo-cutoff"];
     requireReport(!wantsVizo || (dailyFiles.vizo && dailyFiles.settlement && dailyFiles.template),
       "Load both settlement exports and the prepared daily workbook for VIZO.");
     const sentRoles = ["sent-current", "sent-prior"].filter(role => dailyFiles[role]);

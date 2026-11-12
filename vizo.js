@@ -133,53 +133,6 @@ async function readVizoTransit(file, mode, month) {
   return { sheet, fileName: file.name, items, total: items.reduce((sum, item) => sum + item.amount, 0) };
 }
 
-function vizoNativeProvider(cells) {
-  const headings = ["Account Number", "Account Name", "Transaction Date", "Effective Date", "Transaction Description", "Check Number", "Amount", "Balance"];
-  const header = [1, 2].find(row => headings.every((heading, i) => cells.get(csvColumn(i + 1) + row) === heading));
-  if (!header) return undefined;
-  const rows = [];
-  const accounts = new Set(), names = new Set();
-  for (const [address, value] of cells) {
-    const row = Number(/^A([1-9]\d*)$/.exec(address)?.[1]);
-    if (!(row > header)) continue;
-    accounts.add(value);
-    names.add(cells.get("B" + row));
-    const date = sourceDate(cells.get("C" + row));
-    const amount = cents(cells.get("G" + row)), balance = cents(cells.get("H" + row));
-    const previous = rows.at(-1);
-    requireReport(!previous || (date >= previous.date && previous.balance + amount === balance),
-      "Check the VIZO transaction order and running balance at row " + row + ".");
-    const description = String(cells.get("E" + row) ?? "").trim();
-    rows.push({ date, balance, row, amount, description,
-      effectiveDate: cells.get("D" + row), checkNumber: cells.get("F" + row) });
-  }
-  requireReport(rows.length && accounts.size === 1 && names.size === 1 && [...names][0],
-    "Use a VIZO Transaction Summary for one account.");
-  return { first: header + 1, rows, name: [...names][0], account: String([...accounts][0] ?? "").trim() };
-}
-
-async function readVizoBoundary(file, primary, end, through) {
-  requireReport(primary?.account, "Use the original monthly VIZO Transaction Summary with the separate next-month CSV.");
-  requireReport(/\.csv$/i.test(file.name) && file.size <= 20 * 1024 * 1024, "Choose a VIZO Settlement CSV under 20 MB.");
-  const report = vizoNativeProvider(readCsvCells(await file.text()));
-  requireReport(report && report.account === primary.account && vizoAccountMatches("settlement", report.name),
-    "Use a VIZO Transaction Summary for the same Settlement account.");
-  const last = primary.rows.at(-1);
-  const start = report.rows.findIndex(item => item.date > end && item.date > last.date);
-  requireReport(start >= 0 && report.rows[start].date <= through,
-    "Include activity from the first week of the next month beyond the monthly CSV.");
-  const overlap = report.rows.slice(0, start);
-  const fields = ["date", "effectiveDate", "description", "checkNumber", "amount", "balance"];
-  requireReport(!overlap.length || (overlap.length <= primary.rows.length && primary.rows.slice(-overlap.length)
-    .every((item, i) => fields.every(field => item[field] === overlap[i][field]))),
-    "The overlapping transactions differ from the end of the monthly CSV. Review both reports.");
-  const first = report.rows[start];
-  requireReport(last.balance + first.amount === first.balance,
-    "The next-month CSV does not continue the monthly CSV's running balance. Check for missing activity.");
-  return report.rows.slice(start).filter(item => item.date <= through)
-    .map(item => ({ ...item, reviewRow: "Next month row " + item.row, source: file.name }));
-}
-
 async function readVizoTransferReview(primary, files, month) {
   requireReport(primary?.account, "Load the original VIZO Transaction Summary CSV for the selected account.");
   const reports = await Promise.all(files.map(async file => {
