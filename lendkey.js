@@ -429,6 +429,41 @@ function lendLineupSections(lines) {
   return ["Debit", "Credit"].map(name => lines.filter(line => direction(line) === name).sort(compare(keys[name])));
 }
 
+// Home Improvement late fees, calculated the same way as the provider workbook's Recon Adj Wkbook!AI21
+// (Servicing Transaction Net, Late Fee). The provider saves that formula without a calculated value.
+async function readLendServicingLateFees(book) {
+  const sheet = "ServicingTransactionDetail";
+  if (!book?.sheets.has(sheet)) return undefined;
+  const cells = await readCells(book, sheet);
+  const wanted = ["Late_Fee_Component", "Transaction_Type", "Transaction_Amount"];
+  const headers = new Map();
+  for (const [address, value] of cells) {
+    const match = /^([A-Z]+)([1-9]\d*)$/.exec(address);
+    if (!match || Number(match[2]) > 50 || !wanted.includes(String(value ?? "").trim())) continue;
+    const row = Number(match[2]), columns = headers.get(row) ?? {};
+    columns[String(value).trim()] = match[1];
+    headers.set(row, columns);
+  }
+  const found = [...headers].find(([, columns]) => wanted.every(name => columns[name]));
+  if (!found) return undefined;
+  const [headerRow, columns] = found;
+  const rows = new Set();
+  for (const address of cells.keys()) {
+    const match = /^([A-Z]+)([1-9]\d*)$/.exec(address);
+    if (match && match[1] === columns.Transaction_Type && Number(match[2]) > headerRow) rows.add(Number(match[2]));
+  }
+  let credits = 0, debits = 0;
+  for (const row of rows) {
+    const type = String(cells.get(columns.Transaction_Type + row) ?? "").trim().toLowerCase();
+    const fee = cells.get(columns.Late_Fee_Component + row);
+    if (fee === undefined || fee === "" || !type) continue;
+    const amount = cents(fee), sign = Math.sign(readBalance(cells.get(columns.Transaction_Amount + row) ?? 0));
+    if ((type === "regular payment" && sign < 0) || type === "claim payment") credits -= amount;
+    else if ((type === "regular payment" && sign > 0) || type === "interest refund" || type === "principal claim refund") debits += amount;
+  }
+  return { amount: credits - debits, source: sheet + " late fees (Recon Adj Wkbook!AI21 calculation)" };
+}
+
 // Static summary text (journal entries and account notes) from the last Purpose Matchup block in the prepared workbook.
 function lendPriorPurposeLabels(cells) {
   let start;
@@ -858,6 +893,9 @@ async function buildLend(result) {
     const purposeRows = [...purposeBlock.grid].sort((a, b) => a[0] - b[0]).map(([r, cells]) =>
       row(r, [...cells].sort((a, b) => columnNumber(a[0]) - columnNumber(b[0])).map(([, xml]) => xml).join("")));
     summary.push(["Purpose Matchup paste block", "C1:N" + purposeBlock.last]);
+    const hilLateFees = result.purpose.groups.find(group => group.code === "HIL")?.inputs["late-fees"];
+    summary.push(["HIL late fees", hilLateFees == null ? "" : hilLateFees / 100],
+      ["HIL late fees source", result.lateFees ? result.lateFees.source : hilLateFees == null ? "Not entered" : "Entered on the page"]);
     sheets.push(["Purpose Matchup", worksheet("C1:N" + purposeBlock.last, [[3, 4, 14], [5, 5, 18], [6, 7, 14], [8, 8, 16], [9, 14, 14]], purposeRows.join(""))]);
     const dollar = amount => amount == null ? "" : amount / 100;
     sheets.push(table("Carryover review", ["Product", "Type", "Prior amount", "New statement amount", "Suggested ACH rows", "Status"],
@@ -1061,9 +1099,17 @@ lendField("run").addEventListener("click", async () => {
     }
     if (current !== lendRevision) return;
     const purpose = ach ? buildLendPurpose(ach, performance) : undefined;
+    // An entered Home Improvement late fee takes precedence over the provider workbook calculation.
+    let lateFees;
+    const hil = purpose?.groups.find(group => group.code === "HIL");
+    if (hil && hil.inputs["late-fees"] == null) {
+      lateFees = await readLendServicingLateFees(lendSources.portfolio.book ?? lendSources.ach.book);
+      if (current !== lendRevision) return;
+      if (lateFees) hil.inputs["late-fees"] = lateFees.amount;
+    }
     const template = lendSources.performance.file;
     lendResult = { month, from, through, reverse: direction === "reverse", ach, performance, cover, purpose, portfolio, completion, statements, template,
-      statementCash, priorPurpose,
+      statementCash, priorPurpose, lateFees,
       portfolioFile: portfolioSource?.file?.name,
       achFile: lendSources.ach.file?.name, fedFile: lendSources.fed.file?.name, performanceFile: lendSources.performance.file?.name,
       wisdomFile: lendSources.wisdom.file?.name };
