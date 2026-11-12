@@ -131,8 +131,10 @@ function fedLoanProvider(description) {
 
 function providerFedHistory(cells, date1904, provider) {
   if (!/^detailed trial balance report$/i.test(String(cells.get("B1") ?? "").trim())) return undefined;
+  // Wisdom exports the report either with effective and posted dates and separate debit and credit columns, or in
+  // the compact layout with one date and a signed amount. Both are accepted; the compact layout has no posted date.
   const layout = wisdomHistoryLayout(cells);
-  requireReport(layout.separateDates && /\bfederal reserve\b/i.test(layout.name),
+  requireReport(/\bfederal reserve\b/i.test(layout.name),
     "Load the Federal Reserve Detailed Trial Balance or a reviewed provider activity workbook.");
   return wisdomHistory(cells, date1904, layout).rows.filter(row => row.amount && fedLoanProvider(row.description) === provider);
 }

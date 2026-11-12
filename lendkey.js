@@ -376,8 +376,11 @@ function lendLineupLines({ dates, matches }, reverse) {
     for (const item of day.fedRows) {
       if (byFed.has(item)) lines.push({ fed: [item], provider: [byFed.get(item)] });
       else if (item.providerReview) {
+        // LendKey remits a business day before the Fed settles; the monthly workbook dates these rows that way.
+        let remitted = dateOffset(item.date, -1);
+        while ([0, 6].includes(new Date(remitted + "T00:00:00Z").getUTCDay())) remitted = dateOffset(remitted, -1);
         lines.push({ fed: [item], provider: [{
-          date: "", direction: reverse ? (item.direction === "Debit" ? "Credit" : "Debit") : item.direction,
+          date: remitted, direction: reverse ? (item.direction === "Debit" ? "Credit" : "Debit") : item.direction,
           comparison: item.comparison, product: item.providerProduct, reason: item.providerProduct ? "PMTS" : "",
           note: item.providerReview, amount: item.amount,
         }] });
@@ -396,10 +399,26 @@ function lendLineupLines({ dates, matches }, reverse) {
     fed.forEach(item => pending.splice(pending.indexOf(item), 1));
     take(provider);
   }
-  // One Fed amount covering a unique combination of LendKey batches within five days.
+  // A Fed amount settles LendKey activity from the same or up to five earlier days. Try, in order: the closest single
+  // batch with the same amount, then batches from one LendKey date that total the Fed amount (one wire funds that day's
+  // loans), then a unique combination across those days.
+  pending.sort((a, b) => a.periodDate.localeCompare(b.periodDate));
   for (const item of [...pending]) {
-    const candidates = open.filter(batch => batch.comparison === item.comparison && lendDayGap(batch.periodDate, item.periodDate) <= 5);
-    const subset = lendUniqueSubset(candidates, item.amount);
+    const window = open.filter(batch => batch.comparison === item.comparison && batch.periodDate <= item.periodDate
+      && lendDayGap(batch.periodDate, item.periodDate) <= 5);
+    const gap = batch => lendDayGap(batch.periodDate, item.periodDate);
+    const singles = window.filter(batch => batch.amount === item.amount).sort((a, b) => gap(a) - gap(b));
+    let subset = singles.length && (singles.length === 1 || gap(singles[0]) < gap(singles[1])) ? [singles[0]] : undefined;
+    if (!subset) {
+      const solutions = [...new Set(window.map(batch => batch.periodDate))].flatMap(day => {
+        const sameDay = window.filter(batch => batch.periodDate === day);
+        if (sameDay.reduce((sum, batch) => sum + batch.amount, 0) === item.amount && sameDay.length > 1) return [sameDay];
+        const found = sameDay.length <= 12 ? lendUniqueSubset(sameDay, item.amount) : undefined;
+        return found ? [found] : [];
+      });
+      if (solutions.length === 1) [subset] = solutions;
+    }
+    subset ??= lendUniqueSubset(window, item.amount);
     if (!subset) continue;
     lines.push({ fed: [item], provider: subset });
     pending.splice(pending.indexOf(item), 1);
@@ -421,9 +440,11 @@ function lendLineupSections(lines) {
   };
   const lineDate = line => line.provider[0]?.date || line.fed[0]?.date || "";
   const direction = line => (line.fed[0] ?? line.provider[0]).comparison;
+  // Ties on the same date follow the provider report's row order.
+  const sourceRow = line => line.provider[0]?.row ?? Infinity;
   const keys = {
-    Debit: line => [line.fed.length ? 0 : 1, String(line.provider[0]?.reason).toUpperCase() === "FUNDING" ? 0 : 1, lineDate(line)],
-    Credit: line => [line.fed.length ? 0 : 1, productRank(line.provider[0]?.product), lineDate(line)],
+    Debit: line => [line.fed.length ? 0 : 1, String(line.provider[0]?.reason).toUpperCase() === "FUNDING" ? 0 : 1, lineDate(line), sourceRow(line)],
+    Credit: line => [line.fed.length ? 0 : 1, productRank(line.provider[0]?.product), lineDate(line), sourceRow(line)],
   };
   const compare = key => (a, b) => {
     const left = key(a), right = key(b);
@@ -507,7 +528,8 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
   let r = 2;
   for (const code of ["CNL", "HIL", "STU"]) {
     const group = groups.get(code), cash = result.statementCash?.get(code) ?? new Map();
-    const rows = items.filter(item => codeOf(item.product) === code).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+    const rows = items.filter(item => codeOf(item.product) === code)
+      .sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.row ?? 1e9) - (b.row ?? 1e9));
     // The prior-period settlement on the statement identifies the batch that clears last month's A/R or A/P. The
     // settlement can differ by cents from the batch (August 2026: 19,017.75 vs 19,017.38), so take the single
     // closest payment batch within one dollar.
