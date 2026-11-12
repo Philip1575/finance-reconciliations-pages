@@ -1135,7 +1135,8 @@ lendField("run").addEventListener("click", async () => {
     let lateFees;
     const hil = purpose?.groups.find(group => group.code === "HIL");
     if (hil && hil.inputs["late-fees"] == null) {
-      lateFees = await readLendServicingLateFees(lendSources.portfolio.book ?? lendSources.ach.book);
+      // Use whichever loaded workbook has the provider servicing detail.
+      lateFees = await readLendServicingLateFees(lendSources.portfolio.book) ?? await readLendServicingLateFees(lendSources.ach.book);
       if (current !== lendRevision) return;
       if (lateFees) hil.inputs["late-fees"] = lateFees.amount;
     }
