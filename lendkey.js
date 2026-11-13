@@ -543,50 +543,14 @@ function lendPriorPurposeLabels(cells) {
 // Formatting of the prepared workbook's Amounts Lineup and Purpose Matchup, so the review blocks paste in with the same
 // look as the previous month: each output cell takes the format of the matching cell in the last block.
 async function lendReadBlockStyles(book) {
-  if (!book?.sheets.has("Amounts Lineup") || !book.sheets.has("Purpose Matchup")) return undefined;
-  const read = async name => {
-    const xml = await book.zip.file(excelWorksheetPath(book, name)).async("string");
-    const styles = new Map();
-    for (const match of xml.matchAll(/<c r="([A-Z]+\d+)"([^>]*?)\/?>/g)) {
-      const style = /\ss="(\d+)"/.exec(match[2]);
-      if (style) styles.set(match[1], Number(style[1]));
-    }
-    const heights = new Map();
-    for (const [, attributes] of xml.matchAll(/<row\b([^>]*)>/g)) {
-      const rowNumber = /\br="(\d+)"/.exec(attributes)?.[1], height = /\bht="([\d.]+)"/.exec(attributes)?.[1];
-      if (rowNumber && height && /customHeight="(1|true)"/.test(attributes)) heights.set(Number(rowNumber), Number(height));
-    }
-    const merges = [...xml.matchAll(/<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/g)]
-      .map(([, c1, r1, c2, r2]) => ({ c1, r1: Number(r1), c2, r2: Number(r2) }));
-    const cols = [...xml.matchAll(/<col\b([^>]*?)\/?>/g)].map(([, attributes]) =>
-      ["min", "max", "width"].map(key => Number(new RegExp("\\b" + key + "=\"([^\"]*)\"").exec(attributes)?.[1])))
-      .filter(entry => entry.every(Number.isFinite));
-    return { styles, merges, cols, heights, cells: await readCells(book, name) };
-  };
-  const stylesXml = await book.zip.file("xl/styles.xml")?.async("string");
-  if (!stylesXml) return undefined;
-  // Formats that display dates, used to pick a block whose month-end date is formatted as a date.
-  const codes = new Map([...stylesXml.matchAll(/<numFmt numFmtId="(\d+)" formatCode="([^"]*)"/g)].map(([, id, code]) => [id, code]));
-  const cellXfs = /<cellXfs[^>]*>([\s\S]*?)<\/cellXfs>/.exec(stylesXml)?.[1] ?? "";
-  const dateStyles = new Set();
-  [...cellXfs.matchAll(/<xf\b[^>]*>/g)].forEach(([xf], index) => {
-    const id = Number(/numFmtId="(\d+)"/.exec(xf)?.[1] ?? 0);
-    const code = (codes.get(String(id)) ?? "").replace(/&quot;[^&]*&quot;|"[^"]*"|\[[^\]]*\]/g, "");
-    if ((id >= 14 && id <= 22) || (id >= 45 && id <= 47) || (id >= 164 && /[dmy]/i.test(code) && !/[0#]/.test(code))) dateStyles.add(index);
-  });
-  return { lineup: await read("Amounts Lineup"), purpose: await read("Purpose Matchup"), stylesXml, dateStyles,
-    theme: await book.zip.file("xl/theme/theme1.xml")?.async("string") };
+  const formatting = await readWorkbookFormatting(book, ["Amounts Lineup", "Purpose Matchup"]);
+  if (!formatting) return undefined;
+  const { sheets, ...rest } = formatting;
+  return { lineup: sheets["Amounts Lineup"], purpose: sheets["Purpose Matchup"], ...rest };
 }
 
-function lendGridRows(grid, heights = new Map()) {
-  return [...grid].sort((a, b) => a[0] - b[0]).map(([r, cells]) =>
-    `<row r="${r}"${heights.has(r) ? ` ht="${heights.get(r)}" customHeight="1"` : ""}>`
-    + [...cells].sort((a, b) => columnNumber(a[0]) - columnNumber(b[0])).map(([, xml]) => xml).join("") + "</row>").join("");
-}
-
-function lendSheetRows(cells) {
-  return [...new Set([...cells.keys()].map(address => Number(/\d+$/.exec(address)[0])))].sort((a, b) => a - b);
-}
+const lendGridRows = gridRows;
+const lendSheetRows = sheetRows;
 
 // Source rows in the last Amounts Lineup block for each kind of output row.
 function lendLineupStyleRows({ cells, merges }) {
@@ -664,83 +628,9 @@ function lendPurposeStyleRows({ cells, merges, styles }, dateStyles) {
   return roles;
 }
 
-// Applies the borrowed formats (written as s="x<index>") to a block, including the formatted empty cells of each row
-// kind, and returns the merges to carry over: single rows (titles, headers, date bands) and the tie-out differences.
-function lendStyledBlock({ grid, roles, cellRoles = new Map(), diffCells = [] }, source, roleRows, columns, singleRoles) {
-  const styled = new Map();
-  // A role such as "transaction:HIL:funding" uses the most specific source row available: that product and kind, then
-  // that product, then the general "transaction" row.
-  const sourceRow = role => {
-    if (!role) return undefined;
-    const parts = role.split(":");
-    for (let n = parts.length; n > 0; n--) {
-      const row = roleRows[parts.slice(0, n).join(":")];
-      if (row) return row;
-    }
-    return undefined;
-  };
-  const hasRow = role => Boolean(sourceRow(role));
-  // With several source rows, take the format most of them use in that column (unformatted counts as a choice).
-  const styleAt = (role, column) => {
-    const rows = sourceRow(role);
-    if (!rows) return undefined;
-    if (!Array.isArray(rows)) return source.styles.get(column + rows);
-    const counts = new Map();
-    for (const r of rows) {
-      const index = source.styles.get(column + r) ?? "none";
-      counts.set(index, (counts.get(index) ?? 0) + 1);
-    }
-    const [best] = [...counts].sort((a, b) => b[1] - a[1])[0];
-    return best === "none" ? undefined : best;
-  };
-  for (const r of new Set([...grid.keys(), ...roles.keys()])) {
-    const cells = new Map(grid.get(r) ?? []), role = roles.get(r);
-    for (const column of columns) {
-      const address = column + r, cellRole = cellRoles.get(address) ?? role;
-      const index = styleAt(cellRole, column);
-      if (index !== undefined) {
-        if (cells.has(column)) cells.set(column, cells.get(column).replace(/\ss="[^"]*"/, ` s="x${index}"`));
-        else if (role) cells.set(column, `<c r="${address}" s="x${index}"/>`);
-      } else if (cells.has(column) && hasRow(cellRole) && !/\ss="3"/.test(cells.get(column))) {
-        // The source cell has no format (General): match it, but keep dates readable.
-        cells.set(column, cells.get(column).replace(/\ss="[^"]*"/, ` s="0"`));
-      }
-    }
-    styled.set(r, cells);
-  }
-  // Row heights follow the same source rows (title rows are taller for their larger text).
-  const heights = new Map();
-  for (const [r, role] of roles) {
-    const rows = sourceRow(role), first = Array.isArray(rows) ? rows[0] : rows;
-    if (first && source.heights?.has(first)) heights.set(r, source.heights.get(first));
-  }
-  const merges = [];
-  for (const [role, newRow] of singleRoles) {
-    const sourceRow = roleRows[role];
-    if (!sourceRow) continue;
-    for (const m of source.merges.filter(m => m.r1 === sourceRow)) merges.push(m.c1 + newRow + ":" + m.c2 + (newRow + m.r2 - m.r1));
-  }
-  const occupied = r => ["M", "N"].some(column => grid.get(r)?.has(column));
-  const end = Math.max(...grid.keys());
-  for (const r of diffCells) {
-    let last = r;
-    while (last < r + 3 && last + 1 < end && !occupied(last + 1) && !diffCells.includes(last + 1)) last++;
-    if (last === r) continue;
-    merges.push("M" + r + ":N" + last);
-    // Cells inside the merged difference take its format, so the merged area looks the same as the prior block.
-    for (let inner = r; inner <= last; inner++) {
-      const cells = styled.get(inner) ?? new Map();
-      for (const column of ["M", "N"]) {
-        const index = styleAt("diff", column);
-        if (index === undefined) continue;
-        cells.set(column, cells.has(column) && inner === r
-          ? cells.get(column).replace(/\ss="[^"]*"/, ` s="x${index}"`) : `<c r="${column + inner}" s="x${index}"/>`);
-      }
-      styled.set(inner, cells);
-    }
-  }
-  return { styled, merges, heights };
-}
+// LendKey's tie-out differences are merged across M:N, a few rows tall.
+const lendStyledBlock = (block, source, roleRows, columns, singleRoles) =>
+  styledBlock(block, source, roleRows, columns, singleRoles, ["M", "N"]);
 
 // The monthly Purpose Matchup block: month-end date, then Consolidation, Home Improvement and Student sections, then the summary.
 function lendPurposeBlock(result, lines, { label, number, date, formula }) {

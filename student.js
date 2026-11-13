@@ -211,6 +211,8 @@ async function scReadRows(file, source, kind) {
   });
 }
 
+const scMonthStart = monthEnd => monthEnd.slice(0, 8) + "01";
+
 function scCompare(journal, fed, from, to, window, invoice) {
   const entries = journal.filter(item => item.date >= from && item.date <= to).sort((a, b) => a.date.localeCompare(b.date));
   const outside = journal.length - entries.length;
@@ -238,8 +240,27 @@ function scCompare(journal, fed, from, to, window, invoice) {
     group.missingId ||= !entry.transactionId;
     duplicates.set(key, group);
   }
+  // Refunds (RFD) and monthly fee rows (MFA) have their own places in the monthly block rather than Fed groups.
+  const refunds = [], fees = [];
+  for (const entry of entries) {
+    if (review.has(entry)) continue;
+    if (entry.code === "RFD" && entry.date >= scMonthStart(to)) refunds.push(entry);
+    if (entry.code === "MFA") fees.push(entry);
+  }
+  // A payment correction posts a reversal (PMTR) and a re-posted payment (PMT) for the same date and amount in one
+  // journal. The pair nets to zero, so it is left out of the Fed matching and kept together with that journal's group.
+  const pairs = [];
+  const paired = new Set();
+  for (const reversal of entries.filter(entry => entry.code === "PMTR" && !review.has(entry))) {
+    const options = entries.filter(entry => entry.code === "PMT" && !paired.has(entry) && !review.has(entry)
+      && entry.date === reversal.date && entry.amount === -reversal.amount);
+    const repost = options.find(entry => entry.source === reversal.source) ?? (options.length === 1 ? options[0] : undefined);
+    if (!repost) continue;
+    paired.add(reversal).add(repost);
+    pairs.push([reversal, repost]);
+  }
   const usable = entries.filter(entry => {
-    if (review.has(entry)) return false;
+    if (review.has(entry) || paired.has(entry) || refunds.includes(entry) || fees.includes(entry)) return false;
     const duplicatesAtAmount = duplicates.get(fingerprint(entry));
     if (duplicatesAtAmount.count > 1 && duplicatesAtAmount.missingId) review.set(entry, "Repeated journal values · review overlap");
     else if (!entry.cash) review.set(entry, "Review transaction code or zero settlement amount");
@@ -283,18 +304,35 @@ function scCompare(journal, fed, from, to, window, invoice) {
       for (const entry of candidates.flat()) review.set(entry, "Possible Fed match · verify group");
     }
   }
-  const carry = usable.filter(entry => !matched.has(entry) && !review.has(entry) && entry.payment);
-  for (const entry of usable) {
-    if (!matched.has(entry) && !review.has(entry) && !entry.payment) review.set(entry, "Unmatched disbursement · review");
+  // Each correction pair joins the first group holding another entry from the journal that posted it.
+  for (const pair of pairs) {
+    const group = groups.find(item => item.journal.some(entry => entry.source === pair[0].source));
+    if (group) {
+      group.journal.push(...pair);
+      pair.forEach(entry => matched.set(entry, group.id));
+    }
   }
+  const carry = [...usable, ...pairs.flat()].filter(entry => !matched.has(entry) && !review.has(entry) && entry.payment)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const priorMonth = [];
+  for (const entry of usable) {
+    if (matched.has(entry) || review.has(entry) || entry.payment) continue;
+    // A disbursement dated before the month that no Fed entry this month settles was matched in last month's block.
+    if (entry.date < scMonthStart(to)) priorMonth.push(entry);
+    else review.set(entry, "Unmatched disbursement · review");
+  }
+  // Fee rows dated before the last matched payment belong with the invoice line; later ones are in transit.
+  const lastMatched = [...matched.keys()].filter(entry => entry.payment).map(entry => entry.date).sort().at(-1) ?? "";
+  const invoiceFees = fees.filter(entry => entry.date <= lastMatched), transitFees = fees.filter(entry => entry.date > lastMatched);
   const principal = carry.reduce((sum, entry) => sum + entry.principal + entry.capitalized, 0);
   const interest = carry.reduce((sum, entry) => sum + entry.interest, 0);
-  const fees = carry.reduce((sum, entry) => sum + entry.fees, 0);
-  requireReport([principal, interest, fees].every(Number.isSafeInteger), "Carryover totals exceed the supported range.");
+  const carryFees = carry.reduce((sum, entry) => sum + entry.fees, 0);
+  requireReport([principal, interest, carryFees].every(Number.isSafeInteger), "Carryover totals exceed the supported range.");
   for (const entry of review.keys()) {
     if (entry.date < from || entry.date > to) review.delete(entry);
   }
-  return { entries, outside, fed, groups, matched, review, fedReview, carry, principal, interest, fees };
+  return { entries, outside, fed, groups, matched, review, fedReview, carry, principal, interest, fees: carryFees,
+    refunds, invoiceFees, transitFees, pairs, priorMonth };
 }
 
 async function scStatement(file, month) {
@@ -352,9 +390,14 @@ async function scStatement(file, month) {
 async function scCover(file, month, comparison) {
   const formulas = new Set();
   const cells = await readCells(await openExcel(file, true), "Cover Page", formulas);
-  const period = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
-    .format(new Date(month + "-01T00:00:00Z"));
-  requireReport(String(cells.get("B5") ?? "").toLowerCase().includes(period.toLowerCase()), "Check the period in Cover Page!B5.");
+  const periodOf = first => new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
+    .format(new Date(first + "T00:00:00Z"));
+  const period = periodOf(month + "-01"), previousPeriod = periodOf(scOffset(month + "-01", -1).slice(0, 8) + "01");
+  // The cover may already show this month, or be last month's workbook (the filled copy then updates the title).
+  const title = String(cells.get("B5") ?? "");
+  requireReport([period, previousPeriod].some(item => title.toLowerCase().includes(item.toLowerCase())), "Check the period in Cover Page!B5.");
+  const titleUpdate = title.toLowerCase().includes(period.toLowerCase()) ? undefined
+    : title.replace(new RegExp(previousPeriod, "i"), period);
   for (const [row, expected] of [[10, "starting balance"], [17, "ending balance"], [19, "in transit"], [29, "starting interest"], [35, "in transit"]]) {
     requireReport(String(cells.get("C" + row) ?? "").trim().toLowerCase() === expected, "Check the cover layout at C" + row + ".");
   }
@@ -374,8 +417,10 @@ async function scCover(file, month, comparison) {
     const { principal, capitalized, interest } = statement;
     setInput(10, "Starting principal including capitalized interest", principal.beginning.amount + capitalized.beginning.amount,
       principal.beginning.source + " and " + capitalized.beginning.source);
+    // The monthly cover carries new disbursements (and any capitalized interest) on the Capitalized line, K12.
+    setInput(12, "New disbursals and capitalized interest", principal.disbursed.amount + capitalized.capitalized.amount,
+      principal.disbursed.source + " and " + capitalized.capitalized.source);
     for (const [row, title, entry, reduction] of [
-      [11, "New disbursals", principal.disbursed], [12, "Capitalized interest", capitalized.capitalized],
       [13, "Capitalized interest collected", capitalized.collected, true], [14, "Cancelled principal", principal.cancelled, true],
       [16, "Principal received", principal.collected, true], [29, "Starting interest", interest.beginning],
       [30, "New interest", interest.accrued], [31, "Interest capitalized", interest.capitalized, true], [32, "Interest received", interest.collected, true],
@@ -433,7 +478,7 @@ async function scCover(file, month, comparison) {
   }
   requireReport(providerChecks.every(item => Number.isSafeInteger(item.statement) && Number.isSafeInteger(item.calculated - item.statement)),
     "A provider ending balance exceeds the supported range.");
-  return { principalEnd, interestEnd, principalAdjusted, interestAdjusted, inputs, providerChecks,
+  return { principalEnd, interestEnd, principalAdjusted, interestAdjusted, inputs, providerChecks, titleUpdate,
     completion: completionTarget("Cover Page", cells, formulas, "G49", "G53", "K49", "K50") };
 }
 
@@ -467,6 +512,187 @@ function scSummary(result) {
   }
   scField("summary").replaceChildren(table);
   scField("results").hidden = false;
+}
+
+// Source rows in the latest monthly MATCHUP block of the prepared workbook, by kind of row. A block starts with its date in
+// column G (merged down three rows) and the DATE/AMOUNT header three rows below.
+function scBlockStyleRows({ cells, merges }) {
+  const text = address => String(cells.get(address) ?? "").trim().toUpperCase();
+  const starts = merges.filter(m => m.c1 === "G" && m.c2 === "G" && m.r2 > m.r1 && text("A" + (m.r1 + 3)) === "DATE")
+    .map(m => m.r1).sort((a, b) => a - b);
+  const start = starts.at(-1);
+  if (!start) return undefined;
+  const rows = sheetRows(cells).filter(r => r > start + 3);
+  const transitLabel = rows.find(r => text("A" + r) === "TRANSIT");
+  const end = rows.find(r => r > (transitLabel ?? start) && text("A" + r) === "TOTALS") ?? rows.at(-1);
+  const body = rows.filter(r => r <= end);
+  const code = r => text("C" + r);
+  const all = test => { const found = body.filter(test); return found.length ? found : undefined; };
+  const beforeTransit = r => !transitLabel || r < transitLabel;
+  return {
+    start, end, date: start, band2: start + 1, band3: start + 2, header: start + 3,
+    payment: all(r => ["PMT", "PMTR"].includes(code(r)) && !cells.has("J" + r) && beforeTransit(r)),
+    groupEnd: all(r => ["PMT", "PMTR"].includes(code(r)) && cells.has("J" + r) && beforeTransit(r)),
+    dis: all(r => code(r) === "DIS"), rfd: all(r => code(r) === "RFD"),
+    totals: body.find(r => !cells.has("A" + r) && cells.has("D" + r) && cells.has("E" + r) && beforeTransit(r)),
+    invoice: body.find(r => code(r) === "MFA" && cells.has("G" + r)),
+    fee: all(r => code(r) === "MFA" && !cells.has("G" + r) && beforeTransit(r)),
+    transitLabel, transitTotals: transitLabel && end,
+    transit: all(r => transitLabel && r > transitLabel && r < end),
+  };
+}
+
+// The monthly MATCHUP block in the workbook's layout, built from row 1: date, header, payment groups with their Fed
+// amounts, disbursements, refunds, totals, the invoice fee line, Transit, and the journal-entry table to the right.
+function scMonthlyBlock(result) {
+  const { label, number, date } = excelOutputCells();
+  const comparison = result.comparison;
+  const grid = new Map(), roles = new Map();
+  const put = (r, column, xml) => { if (!grid.has(r)) grid.set(r, new Map()); grid.get(r).set(column, xml); };
+  const formula = (address, expression, cents) => `<c r="${address}" s="2"><f>${xmlText(expression)}</f><v>${cents / 100}</v></c>`;
+  const money = (r, column, cents) => { if (cents) put(r, column, number(column + r, cents / 100)); };
+  const journal = (item, r, role) => {
+    put(r, "A", date("A" + r, item.date));
+    put(r, "B", number("B" + r, item.amount / 100));
+    put(r, "C", label("C" + r, item.code));
+    money(r, "D", item.principal + item.capitalized);
+    money(r, "E", item.interest);
+    money(r, "F", item.code === "MFA" ? item.amount : item.fees);
+    roles.set(r, role);
+  };
+  const [year, monthNumber] = result.month.split("-").map(Number);
+  put(1, "G", date("G1", new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10)));
+  roles.set(1, "date").set(2, "band2").set(3, "band3");
+  [["A", "DATE"], ["B", "AMOUNT"], ["C", "DESCRIPTION"], ["D", "PRINCIPAL"], ["E", "INTEREST"], ["F", "FEES"],
+    ["H", "FEDREC MONEY OUT"], ["J", "FEDREC MONEY IN"]].forEach(([column, title]) => put(4, column, label(column + "4", title)));
+  roles.set(4, "header");
+  const byDate = items => [...items].sort((a, b) => a.date.localeCompare(b.date) || (a.row - b.row));
+  let r = 5;
+  const paymentRows = [];
+  // Payment groups: each ends with the check (G) and the Fed money in (J, as a negative like the monthly workbook).
+  for (const group of comparison.groups.filter(item => item.fed.cash > 0)) {
+    const entries = [...byDate(group.journal.filter(item => !comparison.pairs.flat().includes(item))),
+      ...group.journal.filter(item => comparison.pairs.flat().includes(item))];
+    const first = r;
+    entries.forEach((item, i) => { journal(item, r, i === entries.length - 1 ? "groupEnd" : "payment"); paymentRows.push(r); r++; });
+    const last = r - 1, fees = entries.some(item => item.fees);
+    const total = entries.reduce((sum, item) => sum + item.principal + item.capitalized + item.interest + item.fees, 0);
+    put(last, "G", formula("G" + last, `SUM(D${first}:${fees ? "F" : "E"}${last})-J${last}`, total + group.fed.cash));
+    put(last, "J", number("J" + last, -group.fed.cash / 100));
+    r++;
+  }
+  // Disbursements with the Fed money out on the last row of each funding, then one check over all of them.
+  const disRows = [];
+  for (const group of comparison.groups.filter(item => item.fed.cash < 0)) {
+    for (const [i, item] of byDate(group.journal).entries()) {
+      journal(item, r, "dis");
+      if (i === group.journal.length - 1) put(r, "H", number("H" + r, -group.fed.cash / 100));
+      disRows.push(r++);
+    }
+  }
+  if (disRows.length) {
+    const [first, last] = [disRows[0], disRows.at(-1)];
+    const disbursed = comparison.groups.filter(item => item.fed.cash < 0).flatMap(item => item.journal).reduce((sum, item) => sum + item.amount, 0);
+    const fedOut = comparison.groups.filter(item => item.fed.cash < 0).reduce((sum, item) => sum - item.fed.cash, 0);
+    put(last, "G", formula("G" + last, `SUM(B${first}:B${last})-SUM(H${first}:H${last})`, disbursed - fedOut));
+    r++;
+  }
+  const refundRows = [];
+  for (const item of byDate(comparison.refunds)) { journal(item, r, "rfd"); refundRows.push(r++); }
+  // Totals of the matched payments, and the invoice fee line just below them.
+  const totals = r++;
+  roles.set(totals, "totals");
+  const span = column => paymentRows.length ? `${column}${paymentRows[0]}:${column}${paymentRows.at(-1)}` : `${column}${totals}:${column}${totals}`;
+  const payments = comparison.groups.filter(item => item.fed.cash > 0).flatMap(item => item.journal);
+  const sum = key => payments.reduce((total, item) => total + key(item), 0);
+  put(totals, "D", formula("D" + totals, `SUM(${span("D")})`, sum(item => item.principal + item.capitalized)));
+  put(totals, "E", formula("E" + totals, `SUM(${span("E")})`, sum(item => item.interest)));
+  put(totals, "F", formula("F" + totals, `-SUM(${span("F")})`, -sum(item => item.fees)));
+  put(totals, "J", formula("J" + totals, `-SUM(${span("J")})`, comparison.groups.filter(item => item.fed.cash > 0).reduce((total, item) => total + item.fed.cash, 0)));
+  const invoiceRow = r;
+  const feeRows = [];
+  byDate(comparison.invoiceFees).forEach((item, i) => { journal(item, r, i ? "fee" : "invoice"); feeRows.push(r++); });
+  if (result.invoice?.match) {
+    // The invoice paid in the month is labeled with that month, like the provider's invoice (INV-… August).
+    const monthName = new Intl.DateTimeFormat("en-US", { month: "long", timeZone: "UTC" }).format(new Date(Date.UTC(year, monthNumber - 1, 1)));
+    put(invoiceRow, "G", label("G" + invoiceRow, monthName + " Invoice"));
+    put(invoiceRow, "H", number("H" + invoiceRow, -result.invoice.match.cash / 100));
+    roles.set(invoiceRow, "invoice");
+    if (!feeRows.length) r++;
+  }
+  // Transit: the fee total, then this month's entries not yet settled at the Fed, then their totals.
+  r += 2;
+  const transitLabel = r++;
+  put(transitLabel, "A", label("A" + transitLabel, "Transit"));
+  const feeTotal = comparison.invoiceFees.reduce((total, item) => total + item.amount, 0);
+  put(transitLabel, "F", formula("F" + transitLabel, feeRows.length ? `SUM(F${feeRows[0]}:F${feeRows.at(-1)})` : "0", feeTotal));
+  roles.set(transitLabel, "transitLabel");
+  const transitRows = [];
+  for (const item of byDate([...comparison.carry, ...comparison.transitFees])) { journal(item, r, "transit"); transitRows.push(r++); }
+  const end = r;
+  put(end, "A", label("A" + end, "TOTALS"));
+  roles.set(end, "transitTotals");
+  const transit = [...comparison.carry, ...comparison.transitFees];
+  for (const [column, amount] of [["B", transit.reduce((t, i) => t + i.amount, 0)], ["D", comparison.principal], ["E", comparison.interest]]) {
+    put(end, column, formula(column + end, transitRows.length ? `SUM(${column}${transitRows[0]}:${column}${transitRows.at(-1)})` : "0", amount));
+  }
+  return { grid, roles, end, rows: { totals, invoice: invoiceRow, dis: disRows, refunds: refundRows, payments: paymentRows } };
+}
+
+// The journal-entry table to the right of each block (descriptions and G/L accounts) is copied from the prior block at the
+// same row offsets; its amounts point at this block's totals.
+function scJournalTable(block, source, roleRows) {
+  const cells = new Map();
+  if (!source || !roleRows) return cells;
+  const { totals, invoice, dis, refunds } = block.rows;
+  const amounts = {
+    "SC DISBURSEMENTS": dis.length ? `SUM(B${dis[0]}:B${dis.at(-1)})` : "0",
+    "SC CANCELLED DIS": "0", "SC PRINCIPAL": "D" + totals, "SC INTEREST": "-E" + totals, "SC CAPITALIZED INT": "0",
+    "SC REFUNDS": refunds.length ? `SUM(B${refunds[0]}:B${refunds.at(-1)})` : undefined,
+    "LATE PAYMENT FEES": "F" + totals, "SC INVOICE": "H" + invoice,
+  };
+  for (let offset = 0; offset <= roleRows.end - roleRows.start; offset++) {
+    const from = roleRows.start + offset, to = 1 + offset;
+    const name = String(source.cells.get("N" + from) ?? "").trim().toUpperCase();
+    for (const column of ["L", "M", "N", "O", "P", "Q", "R"]) {
+      const style = source.styles.get(column + from), value = source.cells.get(column + from);
+      const sourceFormula = source.formulas.get(column + from);
+      const address = column + to, s = style === undefined ? "0" : "x" + style;
+      if (column === "O" && name in amounts) {
+        if (amounts[name] !== undefined) cells.set(address, `<c r="${address}" s="${s}"><f>${xmlText(amounts[name])}</f></c>`);
+        else if (style !== undefined) cells.set(address, `<c r="${address}" s="${s}"/>`);
+      } else if (["N", "P", "Q"].includes(column) && typeof sourceFormula === "string" && /^O\d+\+O\d+$/i.test(sourceFormula)) {
+        // The check of disbursements less cancellations, moved with the table.
+        const shifted = sourceFormula.replace(/O(\d+)/gi, (_, row) => "O" + (Number(row) - roleRows.start + 1));
+        cells.set(address, `<c r="${address}" s="${s}"><f>${shifted}</f></c>`);
+      } else if (["N", "P", "Q"].includes(column) && offset >= 4 && value !== undefined && value !== "" && !sourceFormula) {
+        // Descriptions and G/L accounts from the table's header row down (the rows above hold the preparer's Fed
+        // amount list, which is month-specific and not copied).
+        cells.set(address, typeof value === "number" ? `<c r="${address}" s="${s}"><v>${value}</v></c>`
+          : `<c r="${address}" s="${s}" t="inlineStr"><is><t>${xmlText(value)}</t></is></c>`);
+      } else if (style !== undefined) {
+        cells.set(address, `<c r="${address}" s="${s}"/>`);
+      }
+    }
+  }
+  return cells;
+}
+
+// The formatted monthly block: borrowed formats for the block rows and the copied journal-entry table.
+function scStyledBlock(result) {
+  const block = scMonthlyBlock(result);
+  const source = result.blockStyles?.sheets.MATCHUP, roleRows = source && scBlockStyleRows(source);
+  const { styled, merges, heights } = roleRows
+    ? styledBlock(block, source, roleRows, ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"], [["date", 1]])
+    : { styled: block.grid, merges: [], heights: new Map() };
+  const table = scJournalTable(block, source, roleRows);
+  for (const [address, xml] of table) {
+    const r = Number(/\d+$/.exec(address)[0]), column = address.replace(/\d+$/, "");
+    if (!styled.has(r)) styled.set(r, new Map());
+    styled.get(r).set(column, xml);
+  }
+  const end = Math.max(block.end, ...[...table.keys()].map(address => Number(/\d+$/.exec(address)[0])));
+  return { styled, merges, heights, end, cols: roleRows && source.cols.length ? source.cols : [[1, 10, 15]] };
 }
 
 async function buildStudent(result) {
@@ -514,6 +740,13 @@ async function buildStudent(result) {
     [19, { label: "Principal in transit", amount: comparison.principal, source: "Journal carryover candidates" }],
     [35, { label: "Interest in transit", amount: comparison.interest, source: "Journal carryover candidates" }],
   ]);
+  // The month's MATCHUP block in the workbook's layout and formatting, ready to paste below the previous month.
+  const block = comparison ? scStyledBlock(result) : undefined;
+  if (block) {
+    summary.push(["MATCHUP paste block", "A1:R" + block.end]);
+    if (comparison.priorMonth.length) summary.push(["Prior-month disbursements left out (matched in last month's block)", comparison.priorMonth.length]);
+    if (comparison.pairs.length) summary.push(["Payment corrections kept with their journal's group", comparison.pairs.length]);
+  }
   const sheets = [sheet("Summary", ["Field", "Value"], summary, [37, 32]),
     sheet("Proposed cover inputs", ["Destination", "Cell", "Input", "Amount", "Source", "Saved cover amount", "Change from cover"],
       [...coverInputs].sort(([a], [b]) => a - b).map(([r, input]) => ["Cover Page", "K" + r, input.label, input.amount / 100, input.source,
@@ -524,66 +757,6 @@ async function buildStudent(result) {
       (item.calculated - item.statement) / 100, item.source]), [40, 20, 20, 18, 54]));
   sheets.push(...completionPasteSheets(result.cover?.completion, audit));
   if (!comparison) return createExcelWorkbook(sheets, audit);
-  const formula = (address, expression, amount) =>
-    `<c r="${address}" s="2"><f>${xmlText(expression)}</f><v>${amount / 100}</v></c>`;
-  const journalCells = (item, r) => journalRow(item).slice(0, 6).map((value, j) => {
-    const address = "ABCDEF"[j] + r;
-    if (j === 0) return date(address, value);
-    return typeof value === "number" ? number(address, value) : label(address, value);
-  }).join("");
-  const matchup = [
-    row(1, label("A1", "Student Choice MATCHUP · " + result.month, 1)),
-    row(3, [...["Date", "Amount", "Description", "Principal", "Interest", "Fees"]
-      .map((title, i) => label("ABCDEF"[i] + "3", title, 1)),
-      label("G3", "Difference", 1), label("H3", "FedRec Money Out", 1), label("J3", "FedRec Money In", 1)].join("")),
-  ];
-  let matchupRow = 4;
-  for (const group of comparison.groups) {
-    const first = matchupRow, last = first + group.journal.length - 1;
-    const code = "C" + first + ":C" + last;
-    const sumCode = (criterion, column) => `SUMIF(${code},"${criterion}",${column}${first}:${column}${last})`;
-    const journalAmount = group.journal.every(item => item.payment) ? "SUM(D" + first + ":F" + last + ")"
-      : group.journal.every(item => item.code === "DIS") ? "SUM(B" + first + ":B" + last + ")"
-        : [sumCode("DIS", "B"), ...["D", "E", "F"].map(column => sumCode("<>DIS", column))].join("+");
-    const expression = "ROUND(" + journalAmount + "-SUM(H" + first + ":H" + last + ")-SUM(J" + first + ":J" + last + "),2)";
-    for (const item of group.journal) {
-      const r = matchupRow++;
-      const fed = r === last ? number((group.fed.cash < 0 ? "H" : "J") + r, -group.fed.cash / 100) : "";
-      const difference = r === last ? formula("G" + r, expression, 0) : "";
-      matchup.push(row(r, journalCells(item, r) + difference + fed));
-    }
-    matchupRow++;
-  }
-  if (comparison.groups.length) {
-    const end = matchupRow - 2, r = matchupRow++;
-    const payments = [...comparison.matched.keys()].filter(item => item.payment);
-    const paymentTotal = (column, amount) => formula(column + r, ["PMT", "PMTR"].map(code =>
-      `SUMIF(C4:C${end},"${code}",${column}4:${column}${end})`).join("+"), amount);
-    const fedTotal = (column, sign) => formula(column + r, `SUM(${column}4:${column}${end})`,
-      comparison.groups.filter(group => Math.sign(group.fed.cash) === sign).reduce((total, group) => total - group.fed.cash, 0));
-    matchup.push(row(r, label("A" + r, "TOTALS", 1)
-      + paymentTotal("D", payments.reduce((total, item) => total + item.principal + item.capitalized, 0))
-      + paymentTotal("E", payments.reduce((total, item) => total + item.interest, 0))
-      + paymentTotal("F", payments.reduce((total, item) => total + item.fees, 0))
-      + fedTotal("H", -1) + fedTotal("J", 1)));
-  }
-  if (result.invoice?.match) {
-    const r = matchupRow++;
-    matchup.push(row(r, label("G" + r, "Billing invoice") + number("H" + r, -result.invoice.match.cash / 100)));
-  }
-  if (comparison.carry.length && !result.carryoverPending) {
-    matchupRow++;
-    matchup.push(row(matchupRow, label("A" + matchupRow, "Transit", 1)));
-    matchupRow++;
-    const first = matchupRow;
-    for (const item of comparison.carry) {
-      const r = matchupRow++;
-      matchup.push(row(r, journalCells(item, r)));
-    }
-    const r = matchupRow++;
-    matchup.push(row(r, label("A" + r, "TOTALS", 1) + [["D", comparison.principal], ["E", comparison.interest], ["F", comparison.fees]]
-      .map(([column, amount]) => formula(column + r, `SUM(${column}${first}:${column}${r - 1})`, amount)).join("")));
-  }
   if (result.invoice) {
     const { candidates, review, date: expected } = result.invoice;
     sheets.push(sheet("Invoice review", ["Fed date", "Debit", "Description", "Source row", "Review"],
@@ -598,7 +771,7 @@ async function buildStudent(result) {
   }
   return createExcelWorkbook([
     ...sheets,
-    ["MATCHUP", worksheet("A1:J" + Math.max(matchupRow - 1, 3), [[1, 10, 19]], matchup.join(""))],
+    ["MATCHUP", worksheet("A1:R" + block.end, block.cols, gridRows(block.styled, block.heights), block.merges)],
     sheet("Journal review", [...headers, "Proposed group or review"], comparison.entries.map(item => [
       ...journalRow(item), comparison.matched.get(item) ?? comparison.review.get(item) ?? "Carryover candidate",
     ]), [...widths, 43]),
@@ -607,7 +780,7 @@ async function buildStudent(result) {
         comparison.groups.find(group => group.fed === item)?.id ?? comparison.fedReview.get(item), item.row, item.financeProvider]), [24, 15, 23, 50, 40, 14, 22]),
     sheet("Journal exceptions", [...headers, "Review"], [...comparison.review].map(([item, reason]) => [...journalRow(item), reason]), [...widths, 45]),
     sheet("Carryover candidates", headers, comparison.carry.map(journalRow), widths),
-  ], audit);
+  ], audit, result.blockStyles && { styles: result.blockStyles.stylesXml, theme: result.blockStyles.theme });
 }
 
 for (const kind of Object.keys(scFiles)) {
@@ -673,8 +846,10 @@ scField("run").addEventListener("click", async () => {
     }
     const template = scFiles.cover[0];
     const cover = template ? await scCover(template, month, carryoverPending ? undefined : comparison) : undefined;
+    // Formatting is a convenience: if it cannot be read, the block is still produced with plain formatting.
+    const blockStyles = template ? await openExcel(template, true).then(book => readWorkbookFormatting(book, ["MATCHUP"])).catch(() => undefined) : undefined;
     if (current !== scRevision) return;
-    scResult = { month, from, window, comparison, cover, invoice, carryoverPending, template, coverFile: template?.name,
+    scResult = { month, from, window, comparison, cover, invoice, carryoverPending, template, coverFile: template?.name, blockStyles,
       statementFile: scFiles.statement[0]?.name, wisdomFile: scFiles.wisdom[0]?.name };
     const canFill = Boolean(cover && (cover.inputs.size || cover.completion));
     scField("download-template").hidden = !canFill;
@@ -690,12 +865,33 @@ scField("run").addEventListener("click", async () => {
 
 function fillStudentTemplate(result) {
   const audit = reconciliationAudit();
+  // The filled workbook must tie to the provider: refuse it when the cover's ending balances, from the values it will hold,
+  // differ from the provider statement (for example a line left with last month's number).
+  const failing = (result.cover.providerChecks ?? []).filter(item => item.calculated !== item.statement);
+  requireReport(!failing.length, "The filled workbook would not tie to the provider statement: " + failing.map(item =>
+    item.label + " ends at " + (item.calculated / 100).toFixed(2) + " but the statement shows " + (item.statement / 100).toFixed(2)).join("; ")
+    + ". Review Provider roll-forward before downloading.");
   const updates = [...result.cover.inputs].map(([row, input]) => ["Cover Page", "K" + row, input.amount / 100]);
+  if (result.cover.titleUpdate) updates.push(["Cover Page", "B5", result.cover.titleUpdate]);
   if (result.cover.completion) {
     const { sheet, initials, date } = result.cover.completion;
     updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
   }
-  return fillExcelTemplate(result.template, updates);
+  // Add the month's MATCHUP block below the last one, formatted like the previous month.
+  const appends = [];
+  if (result.comparison && result.blockStyles) {
+    const source = result.blockStyles.sheets.MATCHUP;
+    const [year, monthNumber] = result.month.split("-").map(Number);
+    const serial = time => (time - Date.UTC(1899, 11, 30)) / 86400000;
+    const [first, last] = [serial(Date.UTC(year, monthNumber - 1, 1)), serial(Date.UTC(year, monthNumber, 0))];
+    const already = source.merges.some(m => m.c1 === "G" && m.c2 === "G" && m.r2 > m.r1
+      && typeof source.cells.get("G" + m.r1) === "number" && source.cells.get("G" + m.r1) >= first && source.cells.get("G" + m.r1) <= last
+      && String(source.cells.get("A" + (m.r1 + 3)) ?? "").trim().toUpperCase() === "DATE");
+    requireReport(!already, "This workbook already has the " + result.month + " MATCHUP block. Use the previous month's workbook.");
+    const block = scStyledBlock(result);
+    appends.push({ sheet: "MATCHUP", grid: block.styled, merges: block.merges, heights: block.heights, end: block.end });
+  }
+  return fillExcelTemplate(result.template, updates, appends);
 }
 
 async function downloadStudent(button, build, name) {

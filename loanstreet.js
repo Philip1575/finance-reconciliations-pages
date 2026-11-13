@@ -104,6 +104,137 @@ async function readCells(workbook, sheetName, formulas) {
   return cells;
 }
 
+// Formatting of the prepared monthly workbook's block sheets (cell formats, merges, column widths, row heights and values),
+// so new monthly blocks can take the format of the matching cells in the last block.
+async function readWorkbookFormatting(book, sheetNames) {
+  if (!book || !sheetNames.every(name => book.sheets.has(name))) return undefined;
+  const read = async name => {
+    const xml = await book.zip.file(excelWorksheetPath(book, name)).async("string");
+    const styles = new Map();
+    for (const match of xml.matchAll(/<c r="([A-Z]+\d+)"([^>]*?)\/?>/g)) {
+      const style = /\ss="(\d+)"/.exec(match[2]);
+      if (style) styles.set(match[1], Number(style[1]));
+    }
+    const heights = new Map();
+    for (const [, attributes] of xml.matchAll(/<row\b([^>]*)>/g)) {
+      const rowNumber = /\br="(\d+)"/.exec(attributes)?.[1], height = /\bht="([\d.]+)"/.exec(attributes)?.[1];
+      if (rowNumber && height && /customHeight="(1|true)"/.test(attributes)) heights.set(Number(rowNumber), Number(height));
+    }
+    const merges = [...xml.matchAll(/<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/g)]
+      .map(([, c1, r1, c2, r2]) => ({ c1, r1: Number(r1), c2, r2: Number(r2) }));
+    const cols = [...xml.matchAll(/<col\b([^>]*?)\/?>/g)].map(([, attributes]) =>
+      ["min", "max", "width"].map(key => Number(new RegExp("\\b" + key + "=\"([^\"]*)\"").exec(attributes)?.[1])))
+      .filter(entry => entry.every(Number.isFinite));
+    const formulas = new Map();
+    const cells = await readCells(book, name, formulas);
+    return { styles, merges, cols, heights, cells, formulas };
+  };
+  const stylesXml = await book.zip.file("xl/styles.xml")?.async("string");
+  if (!stylesXml) return undefined;
+  // Formats that display dates, used to pick a block whose date is formatted as a date.
+  const codes = new Map([...stylesXml.matchAll(/<numFmt numFmtId="(\d+)" formatCode="([^"]*)"/g)].map(([, id, code]) => [id, code]));
+  const cellXfs = /<cellXfs[^>]*>([\s\S]*?)<\/cellXfs>/.exec(stylesXml)?.[1] ?? "";
+  const dateStyles = new Set();
+  [...cellXfs.matchAll(/<xf\b[^>]*>/g)].forEach(([xf], index) => {
+    const id = Number(/numFmtId="(\d+)"/.exec(xf)?.[1] ?? 0);
+    const code = (codes.get(String(id)) ?? "").replace(/&quot;[^&]*&quot;|"[^"]*"|\[[^\]]*\]/g, "");
+    if ((id >= 14 && id <= 22) || (id >= 45 && id <= 47) || (id >= 164 && /[dmy]/i.test(code) && !/[0#]/.test(code))) dateStyles.add(index);
+  });
+  const sheets = {};
+  for (const name of sheetNames) sheets[name] = await read(name);
+  return { sheets, stylesXml, dateStyles, theme: await book.zip.file("xl/theme/theme1.xml")?.async("string") };
+}
+
+function gridRows(grid, heights = new Map()) {
+  return [...grid].sort((a, b) => a[0] - b[0]).map(([r, cells]) =>
+    `<row r="${r}"${heights.has(r) ? ` ht="${heights.get(r)}" customHeight="1"` : ""}>`
+    + [...cells].sort((a, b) => columnNumber(a[0]) - columnNumber(b[0])).map(([, xml]) => xml).join("") + "</row>").join("");
+}
+
+function sheetRows(cells) {
+  return [...new Set([...cells.keys()].map(address => Number(/\d+$/.exec(address)[0])))].sort((a, b) => a - b);
+}
+
+// Applies borrowed formats (cells written with s="x<index>") to a block built from row 1. Each output row has a role
+// naming the kind of row it is; roleRows maps a role to the source row (or rows, using the most common format) in the
+// prior block. Also returns merges to carry over for single rows, merged difference cells and row heights.
+function styledBlock({ grid, roles, cellRoles = new Map(), diffCells = [] }, source, roleRows, columns, singleRoles, diffColumns) {
+  const styled = new Map();
+  // A role such as "transaction:HIL:funding" uses the most specific source row available: that product and kind, then
+  // that product, then the general "transaction" row.
+  const sourceRow = role => {
+    if (!role) return undefined;
+    const parts = role.split(":");
+    for (let n = parts.length; n > 0; n--) {
+      const row = roleRows[parts.slice(0, n).join(":")];
+      if (row) return row;
+    }
+    return undefined;
+  };
+  const hasRow = role => Boolean(sourceRow(role));
+  const styleAt = (role, column) => {
+    const rows = sourceRow(role);
+    if (!rows) return undefined;
+    if (!Array.isArray(rows)) return source.styles.get(column + rows);
+    const counts = new Map();
+    for (const r of rows) {
+      const index = source.styles.get(column + r) ?? "none";
+      counts.set(index, (counts.get(index) ?? 0) + 1);
+    }
+    const [best] = [...counts].sort((a, b) => b[1] - a[1])[0];
+    return best === "none" ? undefined : best;
+  };
+  for (const r of new Set([...grid.keys(), ...roles.keys()])) {
+    const cells = new Map(grid.get(r) ?? []), role = roles.get(r);
+    for (const column of columns) {
+      const address = column + r, cellRole = cellRoles.get(address) ?? role;
+      const index = styleAt(cellRole, column);
+      if (index !== undefined) {
+        if (cells.has(column)) cells.set(column, cells.get(column).replace(/\ss="[^"]*"/, ` s="x${index}"`));
+        else if (role) cells.set(column, `<c r="${address}" s="x${index}"/>`);
+      } else if (cells.has(column) && hasRow(cellRole) && !/\ss="3"/.test(cells.get(column))) {
+        // The source cell has no format (General): match it, but keep dates readable.
+        cells.set(column, cells.get(column).replace(/\ss="[^"]*"/, ` s="0"`));
+      }
+    }
+    styled.set(r, cells);
+  }
+  const heights = new Map();
+  for (const [r, role] of roles) {
+    const rows = sourceRow(role), first = Array.isArray(rows) ? rows[0] : rows;
+    if (first && source.heights?.has(first)) heights.set(r, source.heights.get(first));
+  }
+  const merges = [];
+  for (const [role, newRow] of singleRoles) {
+    const sourceRow = roleRows[role];
+    if (!sourceRow || Array.isArray(sourceRow)) continue;
+    for (const m of source.merges.filter(m => m.r1 === sourceRow)) merges.push(m.c1 + newRow + ":" + m.c2 + (newRow + m.r2 - m.r1));
+  }
+  if (diffColumns) {
+    const [left, right] = diffColumns;
+    const occupied = r => diffColumns.some(column => grid.get(r)?.has(column));
+    const end = Math.max(...grid.keys());
+    for (const r of diffCells) {
+      let last = r;
+      while (last < r + 3 && last + 1 < end && !occupied(last + 1) && !diffCells.includes(last + 1)) last++;
+      if (last === r) continue;
+      merges.push(left + r + ":" + right + last);
+      // Cells inside the merged difference take its format, so the merged area looks the same as the prior block.
+      for (let inner = r; inner <= last; inner++) {
+        const cells = styled.get(inner) ?? new Map();
+        for (const column of diffColumns) {
+          const index = styleAt("diff", column);
+          if (index === undefined) continue;
+          cells.set(column, cells.has(column) && inner === r
+            ? cells.get(column).replace(/\ss="[^"]*"/, ` s="x${index}"`) : `<c r="${column + inner}" s="x${index}"/>`);
+        }
+        styled.set(inner, cells);
+      }
+    }
+  }
+  return { styled, merges, heights };
+}
+
 // Index of a plain cell format with the given number format in the workbook's styles, adding one if needed.
 function templateNumberStyle(stylesDoc, numFmtId) {
   const cellXfs = stylesDoc.getElementsByTagNameNS(spreadsheetNs, "cellXfs")[0];
@@ -520,8 +651,10 @@ async function createExcelWorkbook(sheets, audit = reconciliationAudit(), styleS
     ${theme ? `<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>` : ""}
     ${parts.join("")}
   </Types>`);
+  // Excel recalculates on open, so formulas written without a stored result (copied journal-entry tables) show values.
   zip.file("xl/workbook.xml", `<workbook xmlns="${spreadsheetNs}" xmlns:r="${officeRelNs}">
     <sheets>${names.join("")}</sheets>
+    <calcPr calcId="0" fullCalcOnLoad="1"/>
   </workbook>`);
   zip.file("xl/_rels/workbook.xml.rels", `<Relationships xmlns="${packageRelNs}">
     ${relations.join("")}
