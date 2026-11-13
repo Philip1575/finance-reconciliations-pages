@@ -976,13 +976,17 @@ function lendStatementInput(statements, portfolio, product, schedule, row) {
 }
 
 async function readLendPerformance(workbook, portfolio, statements) {
-  return Promise.all(lendSchedules.map(async schedule => {
-    const cells = workbook ? await readCells(workbook, schedule.name) : undefined;
+  return Promise.all(lendSchedules.map(async (schedule, scheduleIndex) => {
+    const formulas = new Map();
+    const cells = workbook ? await readCells(workbook, schedule.name, formulas) : undefined;
     // Workbook layouts differ between months (an older layout has Adjustments on row 10 and no statement rows), so only
     // rows whose label matches are read from or written to the workbook; the statement PDFs supply the others.
     const layout = new Set(schedule.fields.filter(([row, label]) =>
       !cells || String(cells.get("B" + row) ?? "").trim().toLowerCase() === label.toLowerCase()).map(([row]) => row));
-    const skipped = schedule.fields.filter(([row]) => !layout.has(row));
+    // A line is only worth flagging when the workbook has something else there (a label or numbers); an absent line
+    // (an older layout without the statement rows) leaves nothing stale.
+    const skipped = schedule.fields.filter(([row]) => !layout.has(row)
+      && ["B", "D", "F", "H"].some(column => String(cells?.get(column + row) ?? "").trim() !== ""));
     const entries = ["D", "F", "H"].flatMap((column, index) => {
       const product = ["CNL", "HIL", "STU"][index];
       requireReport(!cells || String(cells.get(column + "4") ?? "").trim().toUpperCase() === product,
@@ -1003,9 +1007,51 @@ async function readLendPerformance(workbook, portfolio, statements) {
       const end = values.get(5) + values.get(6) + plus - less + sum(schedule.other);
       const change = end - values.get(5), difference = end - values.get(schedule.statement);
       requireReport([plus, less, end, change, difference].every(Number.isSafeInteger), "A roll-forward exceeds the supported amount range.");
-      return { column, product, values, plus, less, end, change, difference };
+      // What the filled workbook will contain, and an independent check of it against the statement.
+      const writes = [];
+      const written = new Map();
+      for (const [row] of schedule.fields) {
+        const provider = sourceInput(row);
+        if (provider && layout.has(row)) { writes.push([row, provider.amount / 100]); written.set(row, provider.amount); }
+      }
+      if (cells) {
+        const label = row => String(cells.get("B" + row) ?? "").trim().toLowerCase();
+        // Before LendKey's reclassification, payment reversals and refunds applied to principal shared one
+        // "Adjustments" line (row 10) and row 12 was blank.
+        if (scheduleIndex === 0 && label(10) === "adjustments" && !label(12) && sourceInput(10) && sourceInput(12)) {
+          const amount = sourceInput(10).amount + sourceInput(12).amount;
+          writes.push([10, amount / 100]);
+          written.set(10, amount);
+          written.set(12, 0);
+        }
+        // An ending balance typed as a number (Home Improvement) makes the workbook's check compare the statement with
+        // itself, so it gets the same roll-forward formula as the other products' ending balances.
+        const address = column + schedule.end;
+        if (!formulas.has(address)) {
+          const sibling = ["D", "F", "H"].find(other => other !== column && typeof formulas.get(other + schedule.end) === "string");
+          const pattern = sibling && new RegExp("(^|[^A-Z$])" + sibling + "(\\$?\\d+)", "g");
+          if (pattern) writes.push([schedule.end, { formula: formulas.get(sibling + schedule.end).replace(pattern, "$1" + column + "$2"), cached: end / 100 }]);
+        }
+      }
+      // Independent check: the ending balance from the input cells the filled workbook will hold (written values, or the
+      // values already there) must agree with the statement's ending balance.
+      let check;
+      const statementEnd = sourceInput(schedule.statement)?.amount;
+      if (cells && statementEnd !== undefined) {
+        const at = row => {
+          if (written.has(row)) return written.get(row);
+          const current = cells.get(column + row);
+          return typeof current === "number" ? Math.round(current * 100) : 0;
+        };
+        const total = rows => rows.reduce((sum, row) => sum + at(row), 0);
+        const workbookEnd = at(5) + at(6) + total(schedule.plus) - total(schedule.less) + total(schedule.other);
+        check = { workbookEnd, statementEnd, difference: workbookEnd - statementEnd };
+      }
+      return { column, product, values, plus, less, end, change, difference, writes, check };
     });
-    return { ...schedule, entries, layout, skipped };
+    const handled = new Set(entries.flatMap(entry => entry.writes.map(([row]) => row)));
+    if (handled.has(10) && skipped.some(([row]) => row === 10)) handled.add(12);
+    return { ...schedule, entries, layout, skipped: skipped.filter(([row]) => !handled.has(row)) };
   }));
 }
 
@@ -1074,6 +1120,11 @@ function showLend(result) {
   if (result.performance) {
     const skipped = result.performance.flatMap(schedule => schedule.skipped.map(([row, label]) => schedule.name + " row " + row + " (" + label + ")"));
     if (skipped.length) summary.push(["Check before saving: lines not filled because this workbook's layout differs", skipped.join("; ")]);
+    const checked = result.performance.flatMap(schedule => schedule.entries.filter(entry => entry.check));
+    const failing = checked.filter(entry => entry.check.difference !== entry.difference);
+    if (checked.length) summary.push(["Filled workbook ties to the statements", failing.length
+      ? "No: " + failing.length + " roll-forward(s) differ. The filled download is blocked."
+      : "Yes: all " + checked.length + " roll-forwards"]);
     summary.push(["Statement roll-forwards", result.performance.flatMap(schedule => schedule.entries).length]);
     summary.push(["Statement variances", result.performance.flatMap(schedule => schedule.entries).filter(item => item.difference !== 0).length]);
   }
@@ -1280,7 +1331,10 @@ async function buildLend(result) {
       }
       for (const [r, cells] of [...data].sort((a, b) => a[0] - b[0])) rows.push(row(r, cells));
       sheets.push([schedule.name, worksheet("B2:H" + schedule.difference, [[2, 2, 42], [3, 8, 17]], rows.join(""))]);
-      for (const entry of schedule.entries) summary.push([entry.product + " · " + schedule.name + " variance", entry.difference / 100]);
+      for (const entry of schedule.entries) {
+        summary.push([entry.product + " · " + schedule.name + " variance", entry.difference / 100]);
+        if (entry.check) summary.push([entry.product + " · " + schedule.name + " filled workbook less statement", entry.check.difference / 100]);
+      }
     }
   }
   if (result.performance || result.portfolio || result.statements.size) {
@@ -1482,11 +1536,17 @@ lendField("run").addEventListener("click", async () => {
 
 function fillLendTemplate(result) {
   const audit = reconciliationAudit();
-  // Only rows whose label matches this workbook's layout are written; skipped lines are listed in the review Summary.
-  const updates = result.performance.flatMap(schedule => schedule.entries.flatMap(entry => schedule.fields.flatMap(([row]) => {
-    const provider = lendStatementInput(result.statements, result.portfolio, entry.product, schedule.name, row);
-    return provider && schedule.layout.has(row) ? [[schedule.name, entry.column + row, provider.amount / 100]] : [];
-  })));
+  // The filled workbook must tie to the statements: refuse it when a product's ending balance, recalculated from the
+  // values the workbook will hold, differs from the statement (for example a prior month's number left on a line).
+  // A difference the statement itself has (its lines not adding to its ending balance by a rounding cent) is shown as a
+  // statement variance; only a difference the workbook adds on top of that blocks the download.
+  const failing = result.performance.flatMap(schedule => schedule.entries.filter(entry => entry.check && entry.check.difference !== entry.difference)
+    .map(entry => entry.product + " " + schedule.name + " ends at " + (entry.check.workbookEnd / 100).toFixed(2)
+      + " but the statement shows " + (entry.check.statementEnd / 100).toFixed(2)));
+  requireReport(!failing.length, "The filled workbook would not tie to the statement: " + failing.join("; ")
+    + ". A line was probably not filled because the workbook layout differs. Check the Summary, or use the matching monthly workbook.");
+  const updates = result.performance.flatMap(schedule => schedule.entries.flatMap(entry =>
+    entry.writes.map(([row, value]) => [schedule.name, entry.column + row, value])));
   for (const item of result.cover ?? []) updates.push(["Cover Page", item.ledgerCell, item.ledger / 100]);
   if (result.completion) {
     const { sheet, initials, date } = result.completion;
