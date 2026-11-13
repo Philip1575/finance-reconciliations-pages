@@ -551,12 +551,17 @@ async function lendReadBlockStyles(book) {
       const style = /\ss="(\d+)"/.exec(match[2]);
       if (style) styles.set(match[1], Number(style[1]));
     }
+    const heights = new Map();
+    for (const [, attributes] of xml.matchAll(/<row\b([^>]*)>/g)) {
+      const rowNumber = /\br="(\d+)"/.exec(attributes)?.[1], height = /\bht="([\d.]+)"/.exec(attributes)?.[1];
+      if (rowNumber && height && /customHeight="(1|true)"/.test(attributes)) heights.set(Number(rowNumber), Number(height));
+    }
     const merges = [...xml.matchAll(/<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/g)]
       .map(([, c1, r1, c2, r2]) => ({ c1, r1: Number(r1), c2, r2: Number(r2) }));
     const cols = [...xml.matchAll(/<col\b([^>]*?)\/?>/g)].map(([, attributes]) =>
       ["min", "max", "width"].map(key => Number(new RegExp("\\b" + key + "=\"([^\"]*)\"").exec(attributes)?.[1])))
       .filter(entry => entry.every(Number.isFinite));
-    return { styles, merges, cols, cells: await readCells(book, name) };
+    return { styles, merges, cols, heights, cells: await readCells(book, name) };
   };
   const stylesXml = await book.zip.file("xl/styles.xml")?.async("string");
   if (!stylesXml) return undefined;
@@ -573,9 +578,10 @@ async function lendReadBlockStyles(book) {
     theme: await book.zip.file("xl/theme/theme1.xml")?.async("string") };
 }
 
-function lendGridRows(grid, row) {
+function lendGridRows(grid, heights = new Map()) {
   return [...grid].sort((a, b) => a[0] - b[0]).map(([r, cells]) =>
-    row(r, [...cells].sort((a, b) => columnNumber(a[0]) - columnNumber(b[0])).map(([, xml]) => xml).join(""))).join("");
+    `<row r="${r}"${heights.has(r) ? ` ht="${heights.get(r)}" customHeight="1"` : ""}>`
+    + [...cells].sort((a, b) => columnNumber(a[0]) - columnNumber(b[0])).map(([, xml]) => xml).join("") + "</row>").join("");
 }
 
 function lendSheetRows(cells) {
@@ -586,16 +592,18 @@ function lendSheetRows(cells) {
 function lendLineupStyleRows({ cells, merges }) {
   const text = address => String(cells.get(address) ?? "").trim().toUpperCase();
   const rows = lendSheetRows(cells);
-  // Use the latest complete block: one that ends with the month-end date band merged across C:S.
+  // Use the latest complete block: titles preceded by the month-end date band merged across C:S (rows above the title).
   const titles = rows.filter(r => text("C" + r) === "ACH TRANSACTIONS");
-  const bands = merges.filter(m => m.c1 === "C" && m.c2 === "S" && m.r2 > m.r1).map(m => m.r1);
+  const bands = merges.filter(m => m.c1 === "C" && m.c2 === "S" && m.r2 > m.r1);
   let title, date;
   for (let i = titles.length - 1; i >= 0 && !title; i--) {
-    const band = bands.filter(r => r > titles[i] && r < (titles[i + 1] ?? Infinity)).sort((a, b) => a - b)[0];
-    if (band) [title, date] = [titles[i], band];
+    const band = bands.find(m => m.r2 < titles[i] && m.r2 >= titles[i] - 2);
+    if (band) [title, date] = [titles[i], band.r1];
   }
   if (!title) return undefined;
-  const block = rows.filter(r => r > title + 1 && r < date);
+  const nextBand = bands.map(m => m.r1).filter(r => r > title).sort((a, b) => a - b)[0] ?? Infinity;
+  const nextTitle = titles.find(r => r > title) ?? Infinity;
+  const block = rows.filter(r => r > title + 1 && r < Math.min(nextBand, nextTitle));
   // Data rows use the most common format among all rows of that kind, so one-off highlights are not repeated.
   const debit = block.filter(r => text("E" + r) === "DR" || text("M" + r) === "DEBIT");
   const credit = block.filter(r => text("E" + r) === "CR" || text("M" + r) === "CREDIT");
@@ -694,6 +702,12 @@ function lendStyledBlock({ grid, roles, cellRoles = new Map(), diffCells = [] },
     }
     styled.set(r, cells);
   }
+  // Row heights follow the same source rows (title rows are taller for their larger text).
+  const heights = new Map();
+  for (const [r, role] of roles) {
+    const rows = sourceRow(role), first = Array.isArray(rows) ? rows[0] : rows;
+    if (first && source.heights?.has(first)) heights.set(r, source.heights.get(first));
+  }
   const merges = [];
   for (const [role, newRow] of singleRoles) {
     const sourceRow = roleRows[role];
@@ -719,7 +733,7 @@ function lendStyledBlock({ grid, roles, cellRoles = new Map(), diffCells = [] },
       styled.set(inner, cells);
     }
   }
-  return { styled, merges };
+  return { styled, merges, heights };
 }
 
 // The monthly Purpose Matchup block: month-end date, then Consolidation, Home Improvement and Student sections, then the summary.
@@ -958,10 +972,11 @@ function lendStatementInput(statements, portfolio, product, schedule, row) {
 async function readLendPerformance(workbook, portfolio, statements) {
   return Promise.all(lendSchedules.map(async schedule => {
     const cells = workbook ? await readCells(workbook, schedule.name) : undefined;
-    for (const [row, label] of schedule.fields) {
-      requireReport(!cells || String(cells.get("B" + row) ?? "").trim().toLowerCase() === label.toLowerCase(),
-        schedule.name + "!B" + row + " does not match the expected statement line.");
-    }
+    // Workbook layouts differ between months (an older layout has Adjustments on row 10 and no statement rows), so only
+    // rows whose label matches are read from or written to the workbook; the statement PDFs supply the others.
+    const layout = new Set(schedule.fields.filter(([row, label]) =>
+      !cells || String(cells.get("B" + row) ?? "").trim().toLowerCase() === label.toLowerCase()).map(([row]) => row));
+    const skipped = schedule.fields.filter(([row]) => !layout.has(row));
     const entries = ["D", "F", "H"].flatMap((column, index) => {
       const product = ["CNL", "HIL", "STU"][index];
       requireReport(!cells || String(cells.get(column + "4") ?? "").trim().toUpperCase() === product,
@@ -972,6 +987,8 @@ async function readLendPerformance(workbook, portfolio, statements) {
         const provider = sourceInput(row);
         if (provider) return [row, provider.amount];
         const address = column + row;
+        requireReport(layout.has(row), "The statement PDFs do not supply " + schedule.name + " line " + row
+          + " and the workbook has a different line there. Add the statement PDFs or use the matching monthly workbook.");
         try { return [row, cents(cells.get(address))]; }
         catch { throw new Error("Enter a numeric statement amount at " + schedule.name + "!" + address + ". Use zero when it does not apply."); }
       }));
@@ -982,7 +999,7 @@ async function readLendPerformance(workbook, portfolio, statements) {
       requireReport([plus, less, end, change, difference].every(Number.isSafeInteger), "A roll-forward exceeds the supported amount range.");
       return { column, product, values, plus, less, end, change, difference };
     });
-    return { ...schedule, entries };
+    return { ...schedule, entries, layout, skipped };
   }));
 }
 
@@ -1049,6 +1066,8 @@ function showLend(result) {
     summary.push(["Prior carryovers with an exact candidate", result.purpose.groups.flatMap(group => group.candidates).filter(item => item.items.length).length]);
   }
   if (result.performance) {
+    const skipped = result.performance.flatMap(schedule => schedule.skipped.map(([row, label]) => schedule.name + " row " + row + " (" + label + ")"));
+    if (skipped.length) summary.push(["Check before saving: lines not filled because this workbook's layout differs", skipped.join("; ")]);
     summary.push(["Statement roll-forwards", result.performance.flatMap(schedule => schedule.entries).length]);
     summary.push(["Statement variances", result.performance.flatMap(schedule => schedule.entries).filter(item => item.difference !== 0).length]);
   }
@@ -1065,6 +1084,93 @@ function showLend(result) {
   }
   lendField("summary").replaceChildren(table);
   lendField("results").hidden = false;
+}
+
+// Builds the monthly Amounts Lineup and Purpose Matchup blocks, formatted like the prepared workbook's last blocks when it is
+// loaded. Rows start at 1; the review download writes them as is and the filled workbook appends them below the last block.
+function lendBuildBlocks(result) {
+  const { label, number, date } = excelOutputCells();
+  const formula = (address, expression, value) => `<c r="${address}" s="2"><f>${xmlText(expression)}</f><v>${value / 100}</v></c>`;
+  const lineupGrid = new Map(), lineupRoles = new Map();
+  const place = (address, xml) => {
+    if (!xml) return;
+    const r = Number(/\d+$/.exec(address)[0]);
+    if (!lineupGrid.has(r)) lineupGrid.set(r, new Map());
+    lineupGrid.get(r).set(address.replace(/\d+$/, ""), xml);
+  };
+  // Each month starts with its month-end date in a four-row band (C1:S4), then the titles and headers, then the rows.
+  const [year, monthNumber] = result.month.split("-").map(Number);
+  place("C1", date("C1", new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10)));
+  place("C5", label("C5", "ACH Transactions"));
+  place("L5", label("L5", "Lendkey Transactions"));
+  for (const [col, title] of [["E", "DR/CR"], ["H", "Amount"], ["L", "Date"], ["M", "DR/CR"], ["P", "Description"], ["R", "Amount"]]) place(col + "6", label(col + "6", title));
+  lineupRoles.set(1, "date").set(5, "title").set(6, "header");
+  const text = (address, item) => item ? label(address, item) : "";
+  const directionCode = direction => direction === "Debit" ? "DR" : "CR";
+  const { lines, unmatchedFed } = lendLineupLines(result.ach, result.reverse);
+  let r = 7;
+  lendLineupSections(lines).forEach((section, index) => {
+    if (index && section.length) r++;
+    for (const line of section) {
+      const first = r, count = Math.max(line.fed.length, line.provider.length);
+      const difference = line.fed.reduce((sum, item) => sum + item.amount, 0)
+        - line.provider.reduce((sum, item) => sum + item.amount, 0);
+      for (let i = 0; i < count; i++) {
+        const left = line.fed[i], right = line.provider[i];
+        if (left) {
+          place("E" + r, label("E" + r, directionCode(left.comparison)));
+          place("H" + r, number("H" + r, left.amount / 100));
+        }
+        if (i === 0 && line.fed.length) {
+          place("K" + r, formula("K" + r, `ROUND(SUM(H${first}:H${first + count - 1})-SUM(S${first}:S${first + count - 1}),2)`, difference));
+        }
+        if (right) {
+          if (right.date) place("L" + r, date("L" + r, right.date));
+          place("M" + r, text("M" + r, right.direction));
+          place("N" + r, text("N" + r, right.product));
+          place("P" + r, text("P" + r, right.reason));
+          place("S" + r, number("S" + r, right.amount / 100));
+          place("T" + r, text("T" + r, right.note ?? (i === 0 ? line.note : "")));
+        }
+        lineupRoles.set(r++, index ? "credit" : "debit");
+      }
+    }
+  });
+  const lineupEnd = r - 1;
+  const styles = result.blockStyles;
+  const lineupRoleRows = styles && lendLineupStyleRows(styles.lineup);
+  const lineup = lineupRoleRows
+    ? lendStyledBlock({ grid: lineupGrid, roles: lineupRoles }, styles.lineup, lineupRoleRows,
+      ["C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"],
+      [["date", 1], ["title", 5], ["header", 6]])
+    : { styled: lineupGrid, merges: [], heights: new Map() };
+  // Unmatched Fed items are listed below the block for review only; the filled workbook leaves them out.
+  if (unmatchedFed.length) {
+    r += 4;
+    place("C" + r, label("C" + r, "Unmatched Fed items · review before pasting. Not part of the block above.", 1));
+    r++;
+    for (const item of unmatchedFed) {
+      place("C" + r, date("C" + r, item.date));
+      place("E" + r, label("E" + r, directionCode(item.comparison)));
+      place("H" + r, number("H" + r, item.amount / 100));
+      place("J" + r, text("J" + r, item.reference));
+      place("T" + r, label("T" + r, "Fed row " + item.row));
+      r++;
+    }
+    for (const [row, cells] of lineupGrid) if (row > lineupEnd) lineup.styled.set(row, cells);
+  }
+  const purposeBlock = lendPurposeBlock(result, lines, { label, number, date, formula });
+  const purposeRoleRows = styles && lendPurposeStyleRows(styles.purpose, styles.dateStyles);
+  const purpose = purposeRoleRows
+    ? lendStyledBlock(purposeBlock, styles.purpose, purposeRoleRows, ["C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N"], [["date", 1]])
+    : { styled: purposeBlock.grid, merges: [], heights: new Map() };
+  return {
+    lines,
+    lineup: { ...lineup, end: lineupEnd, lastRow: unmatchedFed.length ? r - 1 : lineupEnd,
+      cols: lineupRoleRows && styles.lineup.cols.length ? styles.lineup.cols : [[3, 20, 14]] },
+    purpose: { ...purpose, end: purposeBlock.last,
+      cols: purposeRoleRows && styles.purpose.cols.length ? styles.purpose.cols : [[3, 4, 14], [5, 5, 18], [6, 7, 14], [8, 8, 16], [9, 14, 14]] },
+  };
 }
 
 async function buildLend(result) {
@@ -1091,76 +1197,10 @@ async function buildLend(result) {
         ["Reviewed Fed items added to " + direction.toLowerCase(), (amounts.reviewedProvider ?? 0) / 100],
         [direction + " difference after review", (amounts.fed - amounts.ach - (amounts.reviewedProvider ?? 0)) / 100]);
     }
-    // Same block layout as the monthly workbook's Amounts Lineup, so rows 1 through the month-end date paste directly.
-    const lineupGrid = new Map(), lineupRoles = new Map();
-    const place = (address, xml) => {
-      if (!xml) return;
-      const r = Number(/\d+$/.exec(address)[0]);
-      if (!lineupGrid.has(r)) lineupGrid.set(r, new Map());
-      lineupGrid.get(r).set(address.replace(/\d+$/, ""), xml);
-    };
-    place("C1", label("C1", "ACH Transactions"));
-    place("L1", label("L1", "Lendkey Transactions"));
-    for (const [col, title] of [["E", "DR/CR"], ["H", "Amount"], ["L", "Date"], ["M", "DR/CR"], ["P", "Description"], ["R", "Amount"]]) place(col + "2", label(col + "2", title));
-    lineupRoles.set(1, "title").set(2, "header");
-    const text = (address, item) => item ? label(address, item) : "";
-    const directionCode = direction => direction === "Debit" ? "DR" : "CR";
-    const { lines, unmatchedFed } = lendLineupLines(result.ach, result.reverse);
-    let r = 3;
-    lendLineupSections(lines).forEach((section, index) => {
-      if (index && section.length) r++;
-      for (const line of section) {
-        const first = r, count = Math.max(line.fed.length, line.provider.length);
-        const difference = line.fed.reduce((sum, item) => sum + item.amount, 0)
-          - line.provider.reduce((sum, item) => sum + item.amount, 0);
-        for (let i = 0; i < count; i++) {
-          const left = line.fed[i], right = line.provider[i];
-          if (left) {
-            place("E" + r, label("E" + r, directionCode(left.comparison)));
-            place("H" + r, number("H" + r, left.amount / 100));
-          }
-          if (i === 0 && line.fed.length) {
-            place("K" + r, formula("K" + r, `ROUND(SUM(H${first}:H${first + count - 1})-SUM(S${first}:S${first + count - 1}),2)`, difference));
-          }
-          if (right) {
-            if (right.date) place("L" + r, date("L" + r, right.date));
-            place("M" + r, text("M" + r, right.direction));
-            place("N" + r, text("N" + r, right.product));
-            place("P" + r, text("P" + r, right.reason));
-            place("S" + r, number("S" + r, right.amount / 100));
-            place("T" + r, text("T" + r, right.note ?? (i === 0 ? line.note : "")));
-          }
-          lineupRoles.set(r++, index ? "credit" : "debit");
-        }
-      }
-    });
-    const [year, monthNumber] = result.month.split("-").map(Number);
-    place("C" + r, date("C" + r, new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10)));
-    lineupRoles.set(r, "date");
-    const blockEnd = r;
-    const lineupSource = result.blockStyles?.lineup, lineupRoleRows = lineupSource && lendLineupStyleRows(lineupSource);
-    const lineupBlock = lineupRoleRows
-      ? lendStyledBlock({ grid: lineupGrid, roles: lineupRoles }, lineupSource, lineupRoleRows,
-        ["C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"],
-        [["title", 1], ["header", 2], ["date", blockEnd]])
-      : { styled: lineupGrid, merges: [] };
-    if (unmatchedFed.length) {
-      r += 4;
-      place("C" + r, label("C" + r, "Unmatched Fed items · review before pasting. Not part of the block above.", 1));
-      r++;
-      for (const item of unmatchedFed) {
-        place("C" + r, date("C" + r, item.date));
-        place("E" + r, label("E" + r, directionCode(item.comparison)));
-        place("H" + r, number("H" + r, item.amount / 100));
-        place("J" + r, text("J" + r, item.reference));
-        place("T" + r, label("T" + r, "Fed row " + item.row));
-        r++;
-      }
-      for (const [row, cells] of lineupGrid) if (row > blockEnd) lineupBlock.styled.set(row, cells);
-    }
-    summary.push(["Amounts Lineup paste block", "C1:T" + blockEnd]);
-    sheets.push(["Amounts Lineup", worksheet("C1:T" + (unmatchedFed.length ? r - 1 : blockEnd),
-      lineupRoleRows && lineupSource.cols.length ? lineupSource.cols : [[3, 20, 14]], lendGridRows(lineupBlock.styled, row), lineupBlock.merges)]);
+    const blocks = lendBuildBlocks(result), { lines } = blocks;
+    summary.push(["Amounts Lineup paste block", "C1:T" + blocks.lineup.end]);
+    sheets.push(["Amounts Lineup", worksheet("C1:T" + blocks.lineup.lastRow, blocks.lineup.cols,
+      lendGridRows(blocks.lineup.styled, blocks.lineup.heights), blocks.lineup.merges)]);
     sheets.push(table("ACH date review", ["Comparison date", "Direction", "Fed rows", "LendKey rows", "Fed amount", "LendKey amount", "Reviewed Fed items", "Difference after review", "Review"],
       dates.map(day => [day.date, day.direction, day.fedCount, day.achCount, day.fed / 100, day.ach / 100, (day.reviewedProvider ?? 0) / 100,
         (day.fed - day.ach - (day.reviewedProvider ?? 0)) / 100, day.sameDate ? "Date totals agree"
@@ -1182,19 +1222,12 @@ async function buildLend(result) {
       result.ach.matches.map(({ provider, fed, direction }) => [direction, provider.amount / 100, provider.settlement,
         provider.periodDate, fed.date, provider.sourceRows.join(", "), fed.row, fed.reference]), [16, 18, 21, 25, 17, 37, 13, 24]));
     const { groups, unknown } = result.purpose;
-    // Same block layout as the monthly workbook's Purpose Matchup: batch-level rows by product with the statement tie-outs.
-    const purposeBlock = lendPurposeBlock(result, lines, { label, number, date, formula });
-    const purposeSource = result.blockStyles?.purpose, purposeRoleRows = purposeSource && lendPurposeStyleRows(purposeSource, result.blockStyles.dateStyles);
-    const purposeStyled = purposeRoleRows
-      ? lendStyledBlock(purposeBlock, purposeSource, purposeRoleRows, ["C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N"], [["date", 1]])
-      : { styled: purposeBlock.grid, merges: [] };
-    summary.push(["Purpose Matchup paste block", "C1:N" + purposeBlock.last]);
+    summary.push(["Purpose Matchup paste block", "C1:N" + blocks.purpose.end]);
     const hilLateFees = result.purpose.groups.find(group => group.code === "HIL")?.inputs["late-fees"];
     summary.push(["HIL late fees", hilLateFees == null ? "" : hilLateFees / 100],
       ["HIL late fees source", result.lateFees ? result.lateFees.source : hilLateFees == null ? "Not entered" : "Entered on the page"]);
-    sheets.push(["Purpose Matchup", worksheet("C1:N" + purposeBlock.last,
-      purposeRoleRows && purposeSource.cols.length ? purposeSource.cols : [[3, 4, 14], [5, 5, 18], [6, 7, 14], [8, 8, 16], [9, 14, 14]],
-      lendGridRows(purposeStyled.styled, row), purposeStyled.merges)]);
+    sheets.push(["Purpose Matchup", worksheet("C1:N" + blocks.purpose.end, blocks.purpose.cols,
+      lendGridRows(blocks.purpose.styled, blocks.purpose.heights), blocks.purpose.merges)]);
     const dollar = amount => amount == null ? "" : amount / 100;
     sheets.push(table("Carryover review", ["Product", "Type", "Prior amount", "New statement amount", "Suggested ACH rows", "Status"],
       groups.flatMap(group => group.candidates.map(item => [group.name, item.type, dollar(item.target),
@@ -1221,6 +1254,8 @@ async function buildLend(result) {
   }
   if (result.performance) {
     summary.push(["Statement input workbook", result.performanceFile]);
+    const skipped = result.performance.flatMap(schedule => schedule.skipped.map(([row, label]) => schedule.name + " row " + row + " (" + label + ")"));
+    if (skipped.length) summary.push(["Statement lines not in this workbook's layout (not filled)", skipped.join("; ")]);
     for (const schedule of result.performance) {
       const rows = [row(2, label("B2", schedule.name, 1)),
         row(4, schedule.entries.map(entry => label(entry.column + "4", entry.product, 1)).join(""))];
@@ -1441,16 +1476,34 @@ lendField("run").addEventListener("click", async () => {
 
 function fillLendTemplate(result) {
   const audit = reconciliationAudit();
+  // Only rows whose label matches this workbook's layout are written; skipped lines are listed in the review Summary.
   const updates = result.performance.flatMap(schedule => schedule.entries.flatMap(entry => schedule.fields.flatMap(([row]) => {
     const provider = lendStatementInput(result.statements, result.portfolio, entry.product, schedule.name, row);
-    return provider ? [[schedule.name, entry.column + row, provider.amount / 100]] : [];
+    return provider && schedule.layout.has(row) ? [[schedule.name, entry.column + row, provider.amount / 100]] : [];
   })));
   for (const item of result.cover ?? []) updates.push(["Cover Page", item.ledgerCell, item.ledger / 100]);
   if (result.completion) {
     const { sheet, initials, date } = result.completion;
     updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
   }
-  return fillExcelTemplate(result.template, updates);
+  // Add the month's Amounts Lineup and Purpose Matchup blocks below the last ones, so the workbook is complete.
+  const appends = [];
+  if (result.ach && result.blockStyles) {
+    // A month's blocks start with its date (the band or date row merged from C); any date in the month counts.
+    const [year, monthNumber] = result.month.split("-").map(Number);
+    const serial = time => (time - Date.UTC(1899, 11, 30)) / 86400000;
+    const [monthStart, monthEnd] = [serial(Date.UTC(year, monthNumber - 1, 1)), serial(Date.UTC(year, monthNumber, 0))];
+    const hasMonth = (sheet, lastColumn) => sheet.merges.some(m => {
+      const value = sheet.cells.get("C" + m.r1);
+      return m.c1 === "C" && m.c2 === lastColumn && typeof value === "number" && value >= monthStart && value <= monthEnd;
+    });
+    requireReport(!hasMonth(result.blockStyles.lineup, "S") && !hasMonth(result.blockStyles.purpose, "J"),
+      "This workbook already has the " + result.month + " Amounts Lineup or Purpose Matchup block. Use the previous month's workbook.");
+    const blocks = lendBuildBlocks(result);
+    appends.push({ sheet: "Amounts Lineup", grid: blocks.lineup.styled, merges: blocks.lineup.merges, heights: blocks.lineup.heights, end: blocks.lineup.end },
+      { sheet: "Purpose Matchup", grid: blocks.purpose.styled, merges: blocks.purpose.merges, heights: blocks.purpose.heights, end: blocks.purpose.end });
+  }
+  return fillExcelTemplate(result.template, updates, appends);
 }
 
 async function downloadLend(button, build, name) {

@@ -104,7 +104,82 @@ async function readCells(workbook, sheetName, formulas) {
   return cells;
 }
 
-async function fillExcelTemplate(file, updates) {
+// Index of a plain cell format with the given number format in the workbook's styles, adding one if needed.
+function templateNumberStyle(stylesDoc, numFmtId) {
+  const cellXfs = stylesDoc.getElementsByTagNameNS(spreadsheetNs, "cellXfs")[0];
+  const xfs = Array.from(cellXfs.children).filter(node => node.localName === "xf");
+  const plain = xfs.findIndex(xf => xf.getAttribute("numFmtId") === String(numFmtId)
+    && ["fontId", "fillId", "borderId"].every(key => (xf.getAttribute(key) ?? "0") === "0"));
+  if (plain >= 0) return plain;
+  const xf = stylesDoc.createElementNS(spreadsheetNs, cellXfs.prefix ? cellXfs.prefix + ":xf" : "xf");
+  for (const [key, value] of [["numFmtId", numFmtId], ["fontId", 0], ["fillId", 0], ["borderId", 0], ["xfId", 0], ["applyNumberFormat", 1]]) xf.setAttribute(key, String(value));
+  cellXfs.append(xf);
+  cellXfs.setAttribute("count", String(xfs.length + 1));
+  return xfs.length;
+}
+
+// Appends a block of rows (built from row 1) below the last used row of a worksheet, shifting the block's own cell
+// references, formulas and merges. Cells written with s="x<index>" use that format index of this same workbook.
+function appendTemplateBlock(doc, block, styleFor) {
+  const sheetData = doc.getElementsByTagNameNS(spreadsheetNs, "sheetData")[0];
+  const rowNodes = Array.from(sheetData.children).filter(node => node.localName === "row");
+  const used = rowNodes.filter(row => Array.from(row.children).some(cell =>
+    Array.from(cell.children).some(child => ["v", "is", "f"].includes(child.localName) && child.textContent.trim() !== "")))
+    .map(row => Number(row.getAttribute("r")));
+  const mergeCells = doc.getElementsByTagNameNS(spreadsheetNs, "mergeCells")[0];
+  const mergeEnds = Array.from(mergeCells?.children ?? []).map(node => Number(/(\d+)$/.exec(node.getAttribute("ref") ?? "")?.[1] ?? 0));
+  const offset = Math.max(0, ...used, ...mergeEnds);
+  const shiftRef = text => text.replace(/(\$?)([A-Z]{1,3})(\$?)(\d+)(?![\d(])/g,
+    (all, colAbs, column, rowAbs, row) => rowAbs ? all : colAbs + column + (Number(row) + offset));
+  const shiftCell = xml => xml
+    .replace(/\br="([A-Z]{1,3})(\d+)"/, (_, column, row) => `r="${column}${Number(row) + offset}"`)
+    .replace(/\ss="([^"]*)"/, (_, style) => ` s="${style.startsWith("x") ? style.slice(1) : styleFor(style)}"`)
+    .replace(/<f>([^<]*)<\/f>/, (_, expression) => `<f>${shiftRef(expression)}</f>`);
+  const parser = new DOMParser();
+  for (const [r, cells] of [...block.grid].filter(([r]) => r <= block.end).sort((a, b) => a[0] - b[0])) {
+    const target = r + offset, height = block.heights?.get(r);
+    const xml = `<row xmlns="${spreadsheetNs}" r="${target}"${height ? ` ht="${height}" customHeight="1"` : ""}>`
+      + [...cells].sort((a, b) => columnNumber(a[0]) - columnNumber(b[0])).map(([, cell]) => shiftCell(cell)).join("") + "</row>";
+    const parsed = parser.parseFromString(xml, "application/xml");
+    requireReport(!parsed.querySelector("parsererror"), "A generated block row could not be written.");
+    const incoming = doc.importNode(parsed.documentElement, true);
+    const existing = rowNodes.find(row => Number(row.getAttribute("r")) === target);
+    if (!existing) {
+      sheetData.insertBefore(incoming, rowNodes.find(row => Number(row.getAttribute("r")) > target) ?? null);
+      continue;
+    }
+    if (height) { existing.setAttribute("ht", String(height)); existing.setAttribute("customHeight", "1"); }
+    for (const cell of Array.from(incoming.children)) {
+      const address = cell.getAttribute("r"), column = columnNumber(address.replace(/\d+$/, ""));
+      const current = Array.from(existing.children).find(node => node.getAttribute("r") === address);
+      if (current) existing.replaceChild(cell, current);
+      else existing.insertBefore(cell, Array.from(existing.children).find(node =>
+        columnNumber((node.getAttribute("r") ?? "").replace(/\d+$/, "")) > column) ?? null);
+    }
+  }
+  if (block.merges.length) {
+    let merges = mergeCells;
+    if (!merges) {
+      merges = doc.createElementNS(spreadsheetNs, sheetData.prefix ? sheetData.prefix + ":mergeCells" : "mergeCells");
+      const after = ["phoneticPr", "conditionalFormatting", "dataValidations", "hyperlinks", "printOptions", "pageMargins", "pageSetup",
+        "headerFooter", "rowBreaks", "colBreaks", "customProperties", "cellWatches", "ignoredErrors", "smartTags", "drawing",
+        "legacyDrawing", "legacyDrawingHF", "picture", "oleObjects", "controls", "webPublishItems", "tableParts", "extLst"];
+      doc.documentElement.insertBefore(merges, Array.from(doc.documentElement.children).find(node => after.includes(node.localName)) ?? null);
+    }
+    for (const ref of block.merges) {
+      const merge = doc.createElementNS(spreadsheetNs, merges.prefix ? merges.prefix + ":mergeCell" : "mergeCell");
+      merge.setAttribute("ref", shiftRef(ref));
+      merges.append(merge);
+    }
+    merges.setAttribute("count", String(merges.children.length));
+  }
+  const dimension = doc.getElementsByTagNameNS(spreadsheetNs, "dimension")[0];
+  const last = block.end + offset, ref = /^([A-Z]+\d+)(?::([A-Z]+)(\d+))?$/.exec(dimension?.getAttribute("ref") ?? "");
+  if (ref && (!ref[3] || Number(ref[3]) < last)) dimension.setAttribute("ref", ref[1] + ":" + (ref[2] ?? "Z") + last);
+  return offset + 1;
+}
+
+async function fillExcelTemplate(file, updates, appends = []) {
   const workbook = await openExcel(file, true);
   const serializer = new XMLSerializer();
   const element = (doc, parent, name) => doc.createElementNS(spreadsheetNs, parent.prefix ? parent.prefix + ":" + name : name);
@@ -167,6 +242,24 @@ async function fillExcelTemplate(file, updates) {
       }
     }
     workbook.zip.file(target, serializer.serializeToString(doc));
+  }
+  if (appends.length) {
+    const stylesDoc = await readXml(workbook.zip, "xl/styles.xml");
+    const plain = new Map();
+    // The app's own plain formats: 2 = number, 3 = date; anything else becomes the workbook's default format.
+    const styleFor = style => {
+      const numFmtId = { 2: 4, 3: 14 }[style];
+      if (!numFmtId) return "0";
+      if (!plain.has(numFmtId)) plain.set(numFmtId, templateNumberStyle(stylesDoc, numFmtId));
+      return String(plain.get(numFmtId));
+    };
+    for (const block of appends) {
+      const target = excelWorksheetPath(workbook, block.sheet);
+      const doc = await readXml(workbook.zip, target);
+      block.startRow = appendTemplateBlock(doc, block, styleFor);
+      workbook.zip.file(target, serializer.serializeToString(doc));
+    }
+    workbook.zip.file("xl/styles.xml", serializer.serializeToString(stylesDoc));
   }
   const doc = await readXml(workbook.zip, "xl/workbook.xml");
   const root = doc.documentElement;

@@ -91,6 +91,18 @@ async function readLendStatementPdf(file, month) {
           amount: entry.amount * sign, source: file.name + " · page 1 · " + entry.label + (sign === -1 ? " · sign reversed" : ""),
         });
       }
+      if (home) {
+        // The Home Improvement statement reports non-cash reductions as credits, charge-offs and cancelled
+        // disbursements; they belong on the cancelled/defaulted line. Lines it never reports are zero for this portfolio,
+        // so the statement alone fills every line and nothing is carried over from a prior workbook.
+        const [destination, labels] = index === 0 ? [23, ["PRIN Credits", "Charge Off (PRIN)", "Cancelled DISB"]] : [24, ["INT Credits", "Charge Offs (INT)"]];
+        const entries = labels.map(label => read(label));
+        values.set(destination, { amount: entries.reduce((sum, entry) => sum + entry.amount, 0),
+          source: file.name + " · page 1 · " + entries.map(entry => entry.label).join(" + ") });
+        for (const [row] of schedule.fields) {
+          if (!values.has(row)) values.set(row, { amount: 0, source: file.name + " · not reported on the Home Improvement statement (zero)" });
+        }
+      }
       return [schedule.name, values];
     }));
     return { product, fields, cash: lendPdfCash(text, product) };
