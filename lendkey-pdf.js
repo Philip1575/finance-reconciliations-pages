@@ -110,3 +110,49 @@ async function readLendStatementPdf(file, month) {
     throw new Error(file.name + ": " + error.message);
   }
 }
+
+// The prior month's LendKey billing invoice: line items, tax and amount due (shared by the VIZO pages).
+async function readVizoLendKeyInvoice(file, month) {
+  const text = await readLocalPdfText(file);
+  requireReport(text.some(item => /^lendkey$/i.test(item.text)) && text.some(item => /^technologies,?$/i.test(item.text)),
+    "The PDF does not identify a LendKey invoice.");
+  const named = value => text.filter(item => item.text.toLowerCase() === value.toLowerCase());
+  const sameRow = (a, b) => Math.abs(a.y - b.y) < 2;
+  const pair = (first, second) => {
+    const candidates = named(second).filter(b => named(first).some(a => a.x < b.x && sameRow(a, b)));
+    requireReport(candidates.length === 1, "Check the " + first + " " + second + " invoice label.");
+    return candidates[0];
+  };
+  const rightAmount = line => {
+    const values = text.filter(item => item.x > line.x && sameRow(item, line) && Number.isFinite(readBalance(item.text)));
+    requireReport(values.length === 1, "An invoice amount is missing or ambiguous.");
+    return cents(values[0].text);
+  };
+  const dateLabel = pair("Invoice", "Date:");
+  const dateMatch = text.find(item => item.x > dateLabel.x && sameRow(item, dateLabel)
+    && /^\d{1,2}-[A-Za-z]{3}-\d{4}$/.test(item.text));
+  requireReport(dateMatch, "The LendKey invoice date could not be verified.");
+  const [day, abbreviation, year] = dateMatch.text.split("-");
+  const months = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const invoiceDate = sourceDate(year + "-" + String(months.indexOf(abbreviation.toLowerCase()) + 1).padStart(2, "0") + "-" + day.padStart(2, "0"));
+  const priorMonth = dateOffset(month + "-01", -1).slice(0, 7);
+  requireReport(invoiceDate.startsWith(priorMonth), "The manual calls for the " + priorMonth + " invoice for this reconciliation.");
+  const subtotalLabel = pair("Invoice", "Total:"), subtotal = rightAmount(subtotalLabel);
+  const tax = rightAmount(pair("Sales", "Tax:")), due = rightAmount(pair("Amount", "Due:"));
+  const number = named("NO.")[0], quantity = named("QTY")[0], amount = named("AMOUNT").find(item => number && sameRow(item, number));
+  requireReport(number && quantity && amount && sameRow(number, quantity) && number.x < quantity.x && quantity.x < amount.x,
+    "The invoice item columns could not be verified.");
+  const items = text.filter(item => Math.abs(item.x - number.x) < 12 && item.y < number.y
+    && item.y > subtotalLabel.y && /^\d+$/.test(item.text)).sort((a, b) => b.y - a.y);
+  requireReport(items.length && items.every((item, i) => Number(item.text) === i + 1), "The invoice item numbers could not be verified.");
+  const lines = items.map((item, i) => {
+    const description = text.filter(word => word.x > number.x + 12 && word.x < quantity.x - 5
+      && word.y <= item.y + 2 && word.y > Math.max(item.y - 19, (items[i + 1]?.y ?? subtotalLabel.y) + 2))
+      .sort((a, b) => Math.abs(a.y - b.y) < 2 ? a.x - b.x : b.y - a.y).map(word => word.text).join(" ");
+    requireReport(description, "An invoice item description is missing.");
+    return { number: Number(item.text), description, amount: rightAmount({ x: amount.x - 3, y: item.y }) };
+  });
+  requireReport(lines.reduce((sum, item) => sum + item.amount, 0) === subtotal && subtotal + tax === due && due > 0,
+    "The line items, tax and invoice amount due do not agree.");
+  return { file: file.name, invoiceDate, lines, subtotal, tax, due };
+}
