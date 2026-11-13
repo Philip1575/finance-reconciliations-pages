@@ -557,19 +557,15 @@ function vbReconcile({ month, vizo, wisdom, books, invoice }) {
       const { templates } = group;
       const each = templates.length > 1 && templates.every(item => item.memo === templates[0].memo);
       if (/lendkey/i.test(group.signature) && templatesFor(account.kind).filter(item => /\blk\b|lendkey/i.test(item.memo)).length > 1) {
-        // The LendKey payment split by product from the invoice. Lines naming no product (the collection fee) went to Student
-        // in last month's split; sales tax goes with Home Improvement.
+        // The LendKey payment split by product from the invoice. Lines naming no product (the collection fee) go to Student;
+        // sales tax goes with Home Improvement.
         const lkTemplates = templatesFor(account.kind).filter(item => /\blk\b|lendkey/i.test(item.memo));
         if (!invoice || invoice.due !== -amount) {
           addReview(account.kind, group.rows[0], invoice ? "The LendKey payment is not the invoice amount due (" + vbMoney.format(invoice.due / 100) + ")" : "Load the LendKey invoice to split this payment");
           continue;
         }
         const products = [["HIL", /home improvement/i], ["CNL", /consolidation/i], ["STU", /student/i]];
-        const productOf = line => products.find(([, pattern]) => pattern.test(line.description))?.[0];
-        for (const line of invoice.lines.filter(line => !productOf(line))) {
-          addReview(account.kind, { date: monthEnd, description: "LendKey invoice line " + line.number + ": " + line.description, amount: -line.amount },
-            "Add to the LK entry of the product it belongs to (it is not in the split)");
-        }
+        const productOf = line => products.find(([, pattern]) => pattern.test(line.description))?.[0] ?? "STU";
         const split = products.map(([code]) => [code, invoice.lines.filter(line => productOf(line) === code).reduce((sum, line) => sum + line.amount, 0) + (code === "HIL" ? invoice.tax : 0)]);
         for (const [code, value] of split) {
           if (!value) continue;
@@ -654,6 +650,35 @@ function vbShow(result) {
   vbField("results").hidden = false;
 }
 
+// Gives cells a red fill (keeping their other formatting): inputs the preparer still has to make.
+async function vbRedCells(blob, name, sheet, addresses) {
+  const workbook = await openExcel(new File([blob], name), true);
+  const serializer = new XMLSerializer();
+  const styles = await readXml(workbook.zip, "xl/styles.xml");
+  const list = tag => styles.getElementsByTagNameNS(spreadsheetNs, tag)[0];
+  const fills = list("fills"), xfs = list("cellXfs");
+  const fill = styles.createElementNS(spreadsheetNs, fills.prefix ? fills.prefix + ":fill" : "fill");
+  fill.innerHTML = '<patternFill xmlns="' + spreadsheetNs + '" patternType="solid"><fgColor rgb="FFFF0000"/><bgColor indexed="64"/></patternFill>';
+  fills.append(fill);
+  fills.setAttribute("count", String(fills.children.length));
+  const target = excelWorksheetPath(workbook, sheet);
+  const doc = await readXml(workbook.zip, target);
+  const cells = new Map(Array.from(doc.getElementsByTagNameNS(spreadsheetNs, "c"), cell => [cell.getAttribute("r"), cell]));
+  for (const address of addresses) {
+    const cell = cells.get(address);
+    requireReport(cell, "Missing cover cell " + sheet + "!" + address + ".");
+    const xf = Array.from(xfs.children)[Number(cell.getAttribute("s") ?? 0)].cloneNode(true);
+    xf.setAttribute("fillId", String(fills.children.length - 1));
+    xf.setAttribute("applyFill", "1");
+    xfs.append(xf);
+    xfs.setAttribute("count", String(xfs.children.length));
+    cell.setAttribute("s", String(xfs.children.length - 1));
+  }
+  workbook.zip.file("xl/styles.xml", serializer.serializeToString(styles));
+  workbook.zip.file(target, serializer.serializeToString(doc));
+  return workbook.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+}
+
 // Each account's workbook with the cover's month, statement and Wisdom balances (after the entries) and the in-transit
 // list: last month's open items that did not clear, then this month's new items. A cover without enough item rows keeps
 // last month's list and is flagged.
@@ -670,9 +695,14 @@ async function vbCovers(result) {
     const updates = [[sheet, "L" + book.statementRow, item.statement / 100], [sheet, "L" + book.ledgerRow, item.projected / 100]];
     if (book.titleRow) updates.push([sheet, "C" + book.titleRow, "For the Month of " + monthName]);
     const sign = book.itemsSign ?? 1;
-    // A cover that carries its month-end Wisdom postings on one clearing line gets their total there instead of a list.
-    const clearing = book.clearingRow && !book.items.length && item.newTransit.length && item.newTransit.every(entry => entry.side === "Wisdom");
-    if (clearing) updates.push([sheet, "L" + book.clearingRow, -item.newTransit.reduce((sum, entry) => sum + entry.amount, 0) / 100]);
+    // A cover that carries month-end postings on one clearing line (Charge Cards: LoanStreet in transit, taken from the
+    // LoanStreet reconciliation) is left blank and red: the preparer enters it as the final check that the account clears.
+    const clearing = book.clearingRow && !book.items.length && item.newTransit.every(entry => entry.side === "Wisdom");
+    if (clearing) {
+      updates.push([sheet, "L" + book.clearingRow, null]);
+      notes.push([book.title, result.month + "-01", "Cover " + sheet + "!L" + book.clearingRow, 0, "Enter the in-transit amount from the LoanStreet reconciliation (left blank and red)."
+        + (item.newTransit.length ? " Wisdom's month-end postings total " + vbMoney.format(-item.newTransit.reduce((sum, entry) => sum + entry.amount, 0) / 100) + " for comparison." : "")]);
+    }
     const lines = clearing ? [] : [
       ...item.carried.map(entry => [entry.description, entry.clears ?? null, entry.date ?? null, entry.amount / 100, entry.note || null]),
       ...item.newTransit.map(entry => [entry.description, /open/.test(entry.side) ? null : { date: nextBusinessDay }, { date: entry.item.date }, sign * entry.amount / 100, null]),
@@ -684,9 +714,13 @@ async function vbCovers(result) {
     let blob;
     try {
       blob = await fillExcelTemplate(book.file, [...updates, ...itemUpdates]);
+      if (clearing) blob = await vbRedCells(blob, book.file.name, sheet, ["L" + book.clearingRow]);
       if (!itemUpdates.length && lines.length + book.items.length) throw new Error("not enough item rows");
     } catch (error) {
-      blob ??= await fillExcelTemplate(book.file, updates);
+      if (!blob) {
+        blob = await fillExcelTemplate(book.file, updates);
+        if (clearing) blob = await vbRedCells(blob, book.file.name, sheet, ["L" + book.clearingRow]);
+      }
       notes.push([book.title, result.month + "-01", "Cover in-transit list", 0, "The cover keeps last month's in-transit list: add " + lines.length
         + " items (" + (rows.length < lines.length ? "the list has " + rows.length + " rows" : error.message) + ")."]);
     }
