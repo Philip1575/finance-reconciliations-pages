@@ -482,6 +482,15 @@ function vbMatch(vizoRows, wisdomRows) {
     take(group, found);
     take(found, group);
   }
+  // Two or three Wisdom postings a few days apart that cancel out (a posting, its reversal and a re-post).
+  for (const item of [...open.wisdom]) {
+    if (!open.wisdom.includes(item)) continue;
+    const near = open.wisdom.filter(other => Math.abs(vbDays(other.date, item.date)) <= 3).slice(0, 12);
+    const found = subsets(near, 3, item).filter(group => group.length > 1 && total(group) === 0).sort((a, b) => a.length - b.length)[0];
+    if (!found) continue;
+    for (const other of found) other.reversed = true;
+    take(found, found);
+  }
   // Investment trades and returned items Wisdom books days later: the same amount anywhere in the month.
   for (const item of [...open.vizo]) {
     const other = open.wisdom.find(candidate => candidate.amount === item.amount);
@@ -689,6 +698,16 @@ function vbReconcile({ month, vizo, wisdom, books, invoice }) {
       const suffix = memoStyle ? " " + (memoStyle[2] ? "CC " : "") + vbMemo(memoStyle[3], month) : " " + month.slice(5) + "/" + month.slice(2, 4);
       entries.push({ account: account.kind, date: monthEnd, memo: shortcut.name.toUpperCase().split(/\s+/)[0] + suffix, amount: -rows.reduce((sum, item) => sum + item.amount, 0),
         dr: shortcut.dr, cr: shortcut.cr, rawDr: shortcut.rawDr, rawCr: shortcut.rawCr, rows, basis: rows.length + " VIZO rows paid to " + shortcut.name + " (cover G/L shortcut)" });
+    }
+    // Investment (CUSIP) activity before the CIO's investment reconciliation is booked: one open line item for the total,
+    // carried on the cover until the investment entries are in Wisdom.
+    const investments = match.vizo.filter(item => /^(external|descriptive)\s+(deposit|withdrawal)\s+cusip\b/i.test(item.description));
+    if (investments.length) {
+      const total = investments.reduce((sum, item) => sum + item.amount, 0);
+      for (const item of investments) { match.vizo.splice(match.vizo.indexOf(item), 1); item.pendingInvestment = true; }
+      const description = "CUSIP activity awaiting the investment reconciliation (" + investments.length + " items)";
+      transit.push({ account: account.kind, item: { date: monthEnd, description, amount: total, side: "VIZO" }, amount: total, description,
+        side: "VIZO (open item until the investment rec)" });
     }
     for (const item of match.vizo) {
       if (item.date >= window.from && ["SETTLEMENT", "ATM"].includes(account.kind)) transit.push({ account: account.kind, item, amount: item.amount, description: item.description, side: "VIZO" });
@@ -902,7 +921,7 @@ function vbBlock(result, item) {
     if (used.has(row)) continue;
     const partners = account.match?.matched.get(row) ?? pseudo.get(row);
     const interest = ["INT", "INTCREDIT"].includes(row.class?.type);
-    const group = groupOf(row, interest || partners ? undefined : transitRows.has(row) ? "Intransit" : "review", interest);
+    const group = groupOf(row, interest || partners ? undefined : row.pendingInvestment ? "Awaiting inv rec" : transitRows.has(row) ? "Intransit" : "review", interest);
     group.vizo.push(row);
     for (const other of partners ?? []) if (!group.wisdom.includes(other)) group.wisdom.push(other);
   }
@@ -927,8 +946,10 @@ function vbBlock(result, item) {
 
   let r = 1 + layout.gap;
   for (const [column, value] of layout.title) raw(r, column, retitle(value));
+  const titleRow = r;
   roles.set(r++, "title");
   for (const [column, value] of layout.head) raw(r, column, value);
+  const headRow = r;
   roles.set(r++, "head");
   r += layout.dataGap ?? 0;
   // ATM: entries go below a TO POST label, after the settlement days.
@@ -1012,14 +1033,15 @@ function vbBlock(result, item) {
     }
     r = last + 2;
   }
-  const end = r - 2;
+  const end = Math.max(r - 2, headRow);
   const source = layout.roles;
   const roleRows = { title: source.title, head: source.head };
   for (const name of ["vizo", "entry", "wisdom", "check"]) if (source[name].length) roleRows[name] = source[name];
   roleRows.entry ??= roleRows.vizo; roleRows.wisdom ??= roleRows.vizo; roleRows.check ??= roleRows.vizo;
   if (source.toPost) roleRows.toPost = source.toPost;
-  const styled = styledBlock({ grid, roles, cellRoles }, layout.format, roleRows, layout.columns, []);
-  if (layout.atm) return { sheet: { name: sheetName, template: layout.template, grid: styled.styled, heights: styled.heights, end, columns: layout.columns }, marks };
+  // The title and header rows keep last month's merged cells (the centered VIZO / Wisdom headings).
+  const styled = styledBlock({ grid, roles, cellRoles }, layout.format, roleRows, layout.columns, [["title", titleRow], ["head", headRow]]);
+  if (layout.atm) return { sheet: { name: sheetName, template: layout.template, grid: styled.styled, heights: styled.heights, merges: styled.merges, end, columns: layout.columns }, marks };
   return { append: { sheet: book.sheet, grid: styled.styled, merges: styled.merges, heights: styled.heights, end, after: layout.after }, marks };
 }
 
@@ -1030,12 +1052,19 @@ async function vbAddSheet(blob, fileName, sheet) {
   const zip = workbook.zip;
   let xml = await zip.file(excelWorksheetPath(workbook, sheet.template)).async("string");
   const rowsXml = gridRows(sheet.grid, sheet.heights).replace(/\ss="x(\d+)"/g, ' s="$1"');
-  xml = xml.replace(/<sheetData\b[^>]*\/>|<sheetData\b[^>]*>[\s\S]*?<\/sheetData>/, "<sheetData>" + rowsXml + "</sheetData>")
+  const merges = sheet.merges?.length ? '<mergeCells count="' + sheet.merges.length + '">' + sheet.merges.map(ref => '<mergeCell ref="' + ref + '"/>').join("") + "</mergeCells>" : "";
+  xml = xml.replace(/<(mergeCells)\b[\s\S]*?<\/\1>|<mergeCells\b[^>]*\/>/g, "")
+    .replace(/<sheetData\b[^>]*\/>|<sheetData\b[^>]*>[\s\S]*?<\/sheetData>/, "<sheetData>" + rowsXml + "</sheetData>")
     .replace(/<(mergeCells|conditionalFormatting|dataValidations|hyperlinks|tableParts|oleObjects|controls|extLst)\b[\s\S]*?<\/\1>/g, "")
     .replace(/<(mergeCells|drawing|legacyDrawing|legacyDrawingHF|picture|tableParts)\b[^>]*\/>/g, "")
     .replace(/(<sheetPr\b[^>]*?)\scodeName="[^"]*"/, "$1").replace(/\stabSelected="(1|true)"/g, "")
     .replace(/(<pageSetup\b[^>]*?)\s[\w]+:id="[^"]*"/, "$1")
     .replace(/<dimension ref="[^"]*"\/>/, '<dimension ref="A1:' + sheet.columns.at(-1) + Math.max(1, sheet.end) + '"/>');
+  // Merged cells go before the first element that follows them in a worksheet.
+  if (merges) {
+    const next = /<(phoneticPr|conditionalFormatting|dataValidations|hyperlinks|printOptions|pageMargins|pageSetup|headerFooter|rowBreaks|colBreaks|ignoredErrors|drawing|legacyDrawing|tableParts|extLst)\b/.exec(xml);
+    xml = next ? xml.slice(0, next.index) + merges + xml.slice(next.index) : xml.replace("</worksheet>", merges + "</worksheet>");
+  }
   let number = 1;
   while (zip.file("xl/worksheets/sheet" + number + ".xml")) number++;
   zip.file("xl/worksheets/sheet" + number + ".xml", xml);
