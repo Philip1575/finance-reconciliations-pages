@@ -540,15 +540,204 @@ function lendPriorPurposeLabels(cells) {
   })));
 }
 
+// Formatting of the prepared workbook's Amounts Lineup and Purpose Matchup, so the review blocks paste in with the same
+// look as the previous month: each output cell takes the format of the matching cell in the last block.
+async function lendReadBlockStyles(book) {
+  if (!book?.sheets.has("Amounts Lineup") || !book.sheets.has("Purpose Matchup")) return undefined;
+  const read = async name => {
+    const xml = await book.zip.file(excelWorksheetPath(book, name)).async("string");
+    const styles = new Map();
+    for (const match of xml.matchAll(/<c r="([A-Z]+\d+)"([^>]*?)\/?>/g)) {
+      const style = /\ss="(\d+)"/.exec(match[2]);
+      if (style) styles.set(match[1], Number(style[1]));
+    }
+    const merges = [...xml.matchAll(/<mergeCell ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/g)]
+      .map(([, c1, r1, c2, r2]) => ({ c1, r1: Number(r1), c2, r2: Number(r2) }));
+    const cols = [...xml.matchAll(/<col\b([^>]*?)\/?>/g)].map(([, attributes]) =>
+      ["min", "max", "width"].map(key => Number(new RegExp("\\b" + key + "=\"([^\"]*)\"").exec(attributes)?.[1])))
+      .filter(entry => entry.every(Number.isFinite));
+    return { styles, merges, cols, cells: await readCells(book, name) };
+  };
+  const stylesXml = await book.zip.file("xl/styles.xml")?.async("string");
+  if (!stylesXml) return undefined;
+  // Formats that display dates, used to pick a block whose month-end date is formatted as a date.
+  const codes = new Map([...stylesXml.matchAll(/<numFmt numFmtId="(\d+)" formatCode="([^"]*)"/g)].map(([, id, code]) => [id, code]));
+  const cellXfs = /<cellXfs[^>]*>([\s\S]*?)<\/cellXfs>/.exec(stylesXml)?.[1] ?? "";
+  const dateStyles = new Set();
+  [...cellXfs.matchAll(/<xf\b[^>]*>/g)].forEach(([xf], index) => {
+    const id = Number(/numFmtId="(\d+)"/.exec(xf)?.[1] ?? 0);
+    const code = (codes.get(String(id)) ?? "").replace(/&quot;[^&]*&quot;|"[^"]*"|\[[^\]]*\]/g, "");
+    if ((id >= 14 && id <= 22) || (id >= 45 && id <= 47) || (id >= 164 && /[dmy]/i.test(code) && !/[0#]/.test(code))) dateStyles.add(index);
+  });
+  return { lineup: await read("Amounts Lineup"), purpose: await read("Purpose Matchup"), stylesXml, dateStyles,
+    theme: await book.zip.file("xl/theme/theme1.xml")?.async("string") };
+}
+
+function lendGridRows(grid, row) {
+  return [...grid].sort((a, b) => a[0] - b[0]).map(([r, cells]) =>
+    row(r, [...cells].sort((a, b) => columnNumber(a[0]) - columnNumber(b[0])).map(([, xml]) => xml).join(""))).join("");
+}
+
+function lendSheetRows(cells) {
+  return [...new Set([...cells.keys()].map(address => Number(/\d+$/.exec(address)[0])))].sort((a, b) => a - b);
+}
+
+// Source rows in the last Amounts Lineup block for each kind of output row.
+function lendLineupStyleRows({ cells, merges }) {
+  const text = address => String(cells.get(address) ?? "").trim().toUpperCase();
+  const rows = lendSheetRows(cells);
+  // Use the latest complete block: one that ends with the month-end date band merged across C:S.
+  const titles = rows.filter(r => text("C" + r) === "ACH TRANSACTIONS");
+  const bands = merges.filter(m => m.c1 === "C" && m.c2 === "S" && m.r2 > m.r1).map(m => m.r1);
+  let title, date;
+  for (let i = titles.length - 1; i >= 0 && !title; i--) {
+    const band = bands.filter(r => r > titles[i] && r < (titles[i + 1] ?? Infinity)).sort((a, b) => a - b)[0];
+    if (band) [title, date] = [titles[i], band];
+  }
+  if (!title) return undefined;
+  const block = rows.filter(r => r > title + 1 && r < date);
+  // Data rows use the most common format among all rows of that kind, so one-off highlights are not repeated.
+  const debit = block.filter(r => text("E" + r) === "DR" || text("M" + r) === "DEBIT");
+  const credit = block.filter(r => text("E" + r) === "CR" || text("M" + r) === "CREDIT");
+  return { title, header: title + 1, debit: debit.length ? debit : undefined, fallback: debit.length ? debit : undefined, date,
+    credit: credit.length ? credit : undefined };
+}
+
+// Source rows in the last Purpose Matchup block for each kind of output row.
+function lendPurposeStyleRows({ cells, merges, styles }, dateStyles) {
+  const text = address => String(cells.get(address) ?? "").trim().toUpperCase();
+  const rows = lendSheetRows(cells);
+  // Use the latest block whose month-end date row (merged across C:J) is formatted as a date and has a summary below it.
+  const dates = merges.filter(m => m.c1 === "C" && m.c2 === "J" && m.r1 === m.r2).map(m => m.r1).sort((a, b) => b - a);
+  let date, summary;
+  for (const candidate of dates) {
+    if (dateStyles && !dateStyles.has(styles.get("C" + candidate))) continue;
+    const next = dates.filter(r => r > candidate).sort((a, b) => a - b)[0] ?? Infinity;
+    summary = rows.find(r => r > candidate && r < next && text("C" + r) === "A/R CLEARED");
+    if (summary) { date = candidate; break; }
+  }
+  if (!summary) return undefined;
+  const block = rows.filter(r => r > date && r < summary);
+  const find = (test, from = date) => block.find(r => r > from && test(r));
+  const isTransaction = r => cells.has("D" + r) && cells.has("J" + r) && text("K" + r) !== "CLEARED";
+  const transaction = find(isTransaction);
+  const fundingLabel = find(r => text("K" + r) === "FUNDING:");
+  const roles = {
+    date, transaction, fallback: transaction, cleared: find(r => text("K" + r) === "CLEARED"),
+    arTransit: find(r => text("H" + r) === "A/R IN TRANSIT"), apTransit: find(r => text("H" + r) === "A/P IN TRANSIT"),
+    fundingLabel, fundingTotal: fundingLabel && fundingLabel + 1,
+    diff: merges.filter(m => m.c1 === "M" && m.c2 === "N" && m.r1 > date && m.r1 < summary).map(m => m.r1).sort((a, b) => a - b)[0],
+  };
+  roles.reversalLabel = find(r => text("L" + r) === "PMT REMITTANCE REVERSAL");
+  roles.reversalTotal = roles.reversalLabel && find(r => text("L" + r) === "TOTAL", roles.reversalLabel - 1);
+  // Each product section has its own shading, and within a section funding, other debits and credits differ, so rows
+  // borrow from the same product and kind of activity.
+  const kindOf = r => text("G" + r) === "FUNDING" ? "funding" : text("D" + r) === "DEBIT" ? "debit" : "credit";
+  for (const [code, , aliases] of lendProducts) {
+    const first = find(r => isTransaction(r) && aliases.includes(text("E" + r)));
+    if (!first) continue;
+    roles["transaction:" + code] = first;
+    for (const kind of ["funding", "debit", "credit"]) {
+      const matching = block.filter(r => isTransaction(r) && aliases.includes(text("E" + r)) && kindOf(r) === kind);
+      if (matching.length) roles["transaction:" + code + ":" + kind] = matching;
+    }
+    roles["arTransit:" + code] = find(r => text("H" + r) === "A/R IN TRANSIT", first);
+    roles["apTransit:" + code] = find(r => text("H" + r) === "A/P IN TRANSIT", first);
+    // A section's cleared row sits just above its first transaction row or within the section.
+    roles["cleared:" + code] = find(r => text("K" + r) === "CLEARED" && r < (roles["apTransit:" + code] ?? summary), first - 2);
+  }
+  for (let i = 0; i < 5; i++) roles["summary" + i] = summary + i;
+  return roles;
+}
+
+// Applies the borrowed formats (written as s="x<index>") to a block, including the formatted empty cells of each row
+// kind, and returns the merges to carry over: single rows (titles, headers, date bands) and the tie-out differences.
+function lendStyledBlock({ grid, roles, cellRoles = new Map(), diffCells = [] }, source, roleRows, columns, singleRoles) {
+  const styled = new Map();
+  // A role such as "transaction:HIL:funding" uses the most specific source row available: that product and kind, then
+  // that product, then the general "transaction" row.
+  const sourceRow = role => {
+    if (!role) return undefined;
+    const parts = role.split(":");
+    for (let n = parts.length; n > 0; n--) {
+      const row = roleRows[parts.slice(0, n).join(":")];
+      if (row) return row;
+    }
+    return undefined;
+  };
+  const hasRow = role => Boolean(sourceRow(role));
+  // With several source rows, take the format most of them use in that column (unformatted counts as a choice).
+  const styleAt = (role, column) => {
+    const rows = sourceRow(role);
+    if (!rows) return undefined;
+    if (!Array.isArray(rows)) return source.styles.get(column + rows);
+    const counts = new Map();
+    for (const r of rows) {
+      const index = source.styles.get(column + r) ?? "none";
+      counts.set(index, (counts.get(index) ?? 0) + 1);
+    }
+    const [best] = [...counts].sort((a, b) => b[1] - a[1])[0];
+    return best === "none" ? undefined : best;
+  };
+  for (const r of new Set([...grid.keys(), ...roles.keys()])) {
+    const cells = new Map(grid.get(r) ?? []), role = roles.get(r);
+    for (const column of columns) {
+      const address = column + r, cellRole = cellRoles.get(address) ?? role;
+      const index = styleAt(cellRole, column);
+      if (index !== undefined) {
+        if (cells.has(column)) cells.set(column, cells.get(column).replace(/\ss="[^"]*"/, ` s="x${index}"`));
+        else if (role) cells.set(column, `<c r="${address}" s="x${index}"/>`);
+      } else if (cells.has(column) && hasRow(cellRole) && !/\ss="3"/.test(cells.get(column))) {
+        // The source cell has no format (General): match it, but keep dates readable.
+        cells.set(column, cells.get(column).replace(/\ss="[^"]*"/, ` s="0"`));
+      }
+    }
+    styled.set(r, cells);
+  }
+  const merges = [];
+  for (const [role, newRow] of singleRoles) {
+    const sourceRow = roleRows[role];
+    if (!sourceRow) continue;
+    for (const m of source.merges.filter(m => m.r1 === sourceRow)) merges.push(m.c1 + newRow + ":" + m.c2 + (newRow + m.r2 - m.r1));
+  }
+  const occupied = r => ["M", "N"].some(column => grid.get(r)?.has(column));
+  const end = Math.max(...grid.keys());
+  for (const r of diffCells) {
+    let last = r;
+    while (last < r + 3 && last + 1 < end && !occupied(last + 1) && !diffCells.includes(last + 1)) last++;
+    if (last === r) continue;
+    merges.push("M" + r + ":N" + last);
+    // Cells inside the merged difference take its format, so the merged area looks the same as the prior block.
+    for (let inner = r; inner <= last; inner++) {
+      const cells = styled.get(inner) ?? new Map();
+      for (const column of ["M", "N"]) {
+        const index = styleAt("diff", column);
+        if (index === undefined) continue;
+        cells.set(column, cells.has(column) && inner === r
+          ? cells.get(column).replace(/\ss="[^"]*"/, ` s="x${index}"`) : `<c r="${column + inner}" s="x${index}"/>`);
+      }
+      styled.set(inner, cells);
+    }
+  }
+  return { styled, merges };
+}
+
 // The monthly Purpose Matchup block: month-end date, then Consolidation, Home Improvement and Student sections, then the summary.
 function lendPurposeBlock(result, lines, { label, number, date, formula }) {
-  const grid = new Map();
+  // roles and cellRoles name the kind of row (or cell) each output belongs to, for borrowing the prior block's formats.
+  const grid = new Map(), roles = new Map(), cellRoles = new Map(), diffCells = [];
   const put = (r, column, xml) => {
     if (!grid.has(r)) grid.set(r, new Map());
     grid.get(r).set(column, xml);
   };
   const text = (r, column, value) => {
     if (value !== undefined && value !== null && value !== "") put(r, column, typeof value === "number" ? number(column + r, value) : label(column + r, value));
+  };
+  const cellRole = (r, columns, role) => { for (const column of columns) cellRoles.set(column + r, role); };
+  const difference = (r, expression, value) => {
+    put(r, "M", formula("M" + r, expression, value));
+    cellRole(r, ["M", "N"], "diff");
+    diffCells.push(r);
   };
   const money = (r, column, amount) => { if (amount != null) put(r, column, number(column + r, amount / 100)); };
   const total = items => items.reduce((sum, item) => sum + item.amount, 0);
@@ -557,6 +746,7 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
   const range = (column, rows) => rows.length ? `${column}${rows[0]}:${column}${rows.at(-1)}` : "";
   const [year, monthNumber] = result.month.split("-").map(Number);
   put(1, "C", date("C1", new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10)));
+  roles.set(1, "date");
   const items = lines.flatMap(line => line.provider);
   const groups = new Map(result.purpose.groups.map(group => [group.code, group]));
   const cleared = { ar: 0, ap: 0 }, inTransit = { ar: [], ap: [] };
@@ -588,6 +778,8 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
       text(r, "G", item.reason);
       money(r, "J", item.amount);
       text(r, "K", note);
+      const kind = upper(item.reason) === "FUNDING" ? "funding" : item.comparison === "Debit" ? "debit" : "credit";
+      roles.set(r, note === "Cleared" ? "cleared:" + code : "transaction:" + code + ":" + kind);
       return r++;
     };
     if (arItem) { write(arItem, "Cleared"); cleared.ar += arItem.amount; }
@@ -599,6 +791,8 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
     const newAR = cash.get("newAR") ?? (group?.inputs["new-ar"] == null ? undefined : -group.inputs["new-ar"]);
     const newAP = cash.get("newAP") ?? group?.inputs["new-ap"] ?? undefined;
     const arRow = r++, apTransitRow = r++;
+    roles.set(arRow, "arTransit:" + code);
+    roles.set(apTransitRow, "apTransit:" + code);
     text(arRow, "H", "A/R in Transit");
     money(arRow, "J", newAR);
     text(arRow, "K", "NEW A/R");
@@ -616,7 +810,7 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
     put(apTransitRow, "M", creditRows.length ? formula("M" + apTransitRow, `SUM(${range("J", creditRows)})`, remitted) : number("M" + apTransitRow, 0));
     money(apTransitRow, "N", remittance);
     if (code !== "STU" && remittance !== undefined) {
-      put(r, "M", formula("M" + r, `ROUND(M${apTransitRow}-N${apTransitRow},2)`, remitted - remittance));
+      difference(r, `ROUND(M${apTransitRow}-N${apTransitRow},2)`, remitted - remittance);
       if (code === "CNL") r++;
     }
     if (code !== "HIL") continue;
@@ -625,11 +819,13 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
       const [, , third, fourth, fifth] = fundingRows;
       const disbursed = lendStatementInput(result.statements, result.portfolio, "HIL", "Loan Principal Recs", 9)?.amount ?? group?.statementFunding;
       const funded = total(funding);
-      put(third, "M", formula("M" + third, `K${fifth}-L${fifth}`, disbursed == null ? funded : funded - disbursed));
+      difference(third, `K${fifth}-L${fifth}`, disbursed == null ? funded : funded - disbursed);
       text(fourth, "K", "Funding:");
       text(fourth, "L", "Disbursed:");
       put(fifth, "K", formula("K" + fifth, `SUM(${range("J", fundingRows)})`, funded));
       money(fifth, "L", disbursed);
+      cellRole(fourth, ["K", "L"], "fundingLabel");
+      cellRole(fifth, ["K", "L"], "fundingTotal");
     }
     // Reversal tie-out: payment reversals after the cleared A/P against the statement's remittance reversal line.
     const reversalStart = apRow ?? otherRows[0];
@@ -639,13 +835,13 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
       if (fundingRows.length !== 5) {
         text(fundingRows.at(-1), "L", "PMT REMITTANCE REVERSAL");
         text(fundingRows.at(-1), "N", "PDF");
+        cellRole(fundingRows.at(-1), ["L", "N"], "reversalLabel");
       }
       text(reversalStart, "L", "TOTAL");
       put(reversalStart, "M", otherRows.length ? formula("M" + reversalStart, `SUM(${range("J", otherRows)})`, reversed) : number("M" + reversalStart, 0));
       money(reversalStart, "N", reversal);
-      if (reversal !== undefined) {
-        put(reversalStart + 1, "M", formula("M" + (reversalStart + 1), `ROUND(M${reversalStart}-N${reversalStart},2)`, reversed - reversal));
-      }
+      cellRole(reversalStart, ["L", "M", "N"], "reversalTotal");
+      if (reversal !== undefined) difference(reversalStart + 1, `ROUND(M${reversalStart}-N${reversalStart},2)`, reversed - reversal);
     }
   }
   const s = r, prior = result.priorPurpose;
@@ -654,6 +850,7 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
     new Map([["G", "A/P Cleared"], ["K", "CNL"]]), new Map([["G", "Late Fees"], ["K", "PSL"]]), new Map([["G", "New A/R"]]),
   ];
   ["A/R CLEARED", "A/P CLEARED", "LATE FEES", "NEW A/R", "NEW A/P"].forEach((title, i) => {
+    roles.set(s + i, "summary" + i);
     text(s + i, "C", title);
     for (const [column, value] of prior?.[i] ?? defaults[i]) text(s + i, column, value);
   });
@@ -666,7 +863,7 @@ function lendPurposeBlock(result, lines, { label, number, date, formula }) {
     put(s + offset, "D", formula("D" + (s + offset), `SUM(${entries.map(([row]) => "J" + row).join(",")})`,
       entries.reduce((sum, [, amount]) => sum + amount, 0)));
   }
-  return { grid, last: s + 4 };
+  return { grid, roles, cellRoles, diffCells, last: s + 4 };
 }
 
 function lendClearingCandidate(items, target) {
@@ -895,11 +1092,17 @@ async function buildLend(result) {
         [direction + " difference after review", (amounts.fed - amounts.ach - (amounts.reviewedProvider ?? 0)) / 100]);
     }
     // Same block layout as the monthly workbook's Amounts Lineup, so rows 1 through the month-end date paste directly.
-    const lineup = [
-      row(1, label("C1", "ACH Transactions") + label("L1", "Lendkey Transactions")),
-      row(2, [["E", "DR/CR"], ["H", "Amount"], ["L", "Date"], ["M", "DR/CR"], ["P", "Description"], ["R", "Amount"]]
-        .map(([col, title]) => label(col + "2", title)).join("")),
-    ];
+    const lineupGrid = new Map(), lineupRoles = new Map();
+    const place = (address, xml) => {
+      if (!xml) return;
+      const r = Number(/\d+$/.exec(address)[0]);
+      if (!lineupGrid.has(r)) lineupGrid.set(r, new Map());
+      lineupGrid.get(r).set(address.replace(/\d+$/, ""), xml);
+    };
+    place("C1", label("C1", "ACH Transactions"));
+    place("L1", label("L1", "Lendkey Transactions"));
+    for (const [col, title] of [["E", "DR/CR"], ["H", "Amount"], ["L", "Date"], ["M", "DR/CR"], ["P", "Description"], ["R", "Amount"]]) place(col + "2", label(col + "2", title));
+    lineupRoles.set(1, "title").set(2, "header");
     const text = (address, item) => item ? label(address, item) : "";
     const directionCode = direction => direction === "Debit" ? "DR" : "CR";
     const { lines, unmatchedFed } = lendLineupLines(result.ach, result.reverse);
@@ -912,31 +1115,52 @@ async function buildLend(result) {
           - line.provider.reduce((sum, item) => sum + item.amount, 0);
         for (let i = 0; i < count; i++) {
           const left = line.fed[i], right = line.provider[i];
-          const fedCells = left ? label("E" + r, directionCode(left.comparison)) + number("H" + r, left.amount / 100) : "";
-          const check = i === 0 && line.fed.length
-            ? formula("K" + r, `ROUND(SUM(H${first}:H${first + count - 1})-SUM(S${first}:S${first + count - 1}),2)`, difference) : "";
-          const achCells = right ? (right.date ? date("L" + r, right.date) : "") + text("M" + r, right.direction)
-            + text("N" + r, right.product) + text("P" + r, right.reason) + number("S" + r, right.amount / 100)
-            + text("T" + r, right.note ?? (i === 0 ? line.note : "")) : "";
-          lineup.push(row(r++, fedCells + check + achCells));
+          if (left) {
+            place("E" + r, label("E" + r, directionCode(left.comparison)));
+            place("H" + r, number("H" + r, left.amount / 100));
+          }
+          if (i === 0 && line.fed.length) {
+            place("K" + r, formula("K" + r, `ROUND(SUM(H${first}:H${first + count - 1})-SUM(S${first}:S${first + count - 1}),2)`, difference));
+          }
+          if (right) {
+            if (right.date) place("L" + r, date("L" + r, right.date));
+            place("M" + r, text("M" + r, right.direction));
+            place("N" + r, text("N" + r, right.product));
+            place("P" + r, text("P" + r, right.reason));
+            place("S" + r, number("S" + r, right.amount / 100));
+            place("T" + r, text("T" + r, right.note ?? (i === 0 ? line.note : "")));
+          }
+          lineupRoles.set(r++, index ? "credit" : "debit");
         }
       }
     });
     const [year, monthNumber] = result.month.split("-").map(Number);
-    lineup.push(row(r, date("C" + r, new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10))));
+    place("C" + r, date("C" + r, new Date(Date.UTC(year, monthNumber, 0)).toISOString().slice(0, 10)));
+    lineupRoles.set(r, "date");
     const blockEnd = r;
+    const lineupSource = result.blockStyles?.lineup, lineupRoleRows = lineupSource && lendLineupStyleRows(lineupSource);
+    const lineupBlock = lineupRoleRows
+      ? lendStyledBlock({ grid: lineupGrid, roles: lineupRoles }, lineupSource, lineupRoleRows,
+        ["C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T"],
+        [["title", 1], ["header", 2], ["date", blockEnd]])
+      : { styled: lineupGrid, merges: [] };
     if (unmatchedFed.length) {
       r += 4;
-      lineup.push(row(r, label("C" + r, "Unmatched Fed items · review before pasting. Not part of the block above.", 1)));
+      place("C" + r, label("C" + r, "Unmatched Fed items · review before pasting. Not part of the block above.", 1));
       r++;
       for (const item of unmatchedFed) {
-        lineup.push(row(r, date("C" + r, item.date) + label("E" + r, directionCode(item.comparison)) + number("H" + r, item.amount / 100)
-          + text("J" + r, item.reference) + label("T" + r, "Fed row " + item.row)));
+        place("C" + r, date("C" + r, item.date));
+        place("E" + r, label("E" + r, directionCode(item.comparison)));
+        place("H" + r, number("H" + r, item.amount / 100));
+        place("J" + r, text("J" + r, item.reference));
+        place("T" + r, label("T" + r, "Fed row " + item.row));
         r++;
       }
+      for (const [row, cells] of lineupGrid) if (row > blockEnd) lineupBlock.styled.set(row, cells);
     }
     summary.push(["Amounts Lineup paste block", "C1:T" + blockEnd]);
-    sheets.push(["Amounts Lineup", worksheet("C1:T" + (unmatchedFed.length ? r - 1 : blockEnd), [[3, 20, 14]], lineup.join(""))]);
+    sheets.push(["Amounts Lineup", worksheet("C1:T" + (unmatchedFed.length ? r - 1 : blockEnd),
+      lineupRoleRows && lineupSource.cols.length ? lineupSource.cols : [[3, 20, 14]], lendGridRows(lineupBlock.styled, row), lineupBlock.merges)]);
     sheets.push(table("ACH date review", ["Comparison date", "Direction", "Fed rows", "LendKey rows", "Fed amount", "LendKey amount", "Reviewed Fed items", "Difference after review", "Review"],
       dates.map(day => [day.date, day.direction, day.fedCount, day.achCount, day.fed / 100, day.ach / 100, (day.reviewedProvider ?? 0) / 100,
         (day.fed - day.ach - (day.reviewedProvider ?? 0)) / 100, day.sameDate ? "Date totals agree"
@@ -960,13 +1184,17 @@ async function buildLend(result) {
     const { groups, unknown } = result.purpose;
     // Same block layout as the monthly workbook's Purpose Matchup: batch-level rows by product with the statement tie-outs.
     const purposeBlock = lendPurposeBlock(result, lines, { label, number, date, formula });
-    const purposeRows = [...purposeBlock.grid].sort((a, b) => a[0] - b[0]).map(([r, cells]) =>
-      row(r, [...cells].sort((a, b) => columnNumber(a[0]) - columnNumber(b[0])).map(([, xml]) => xml).join("")));
+    const purposeSource = result.blockStyles?.purpose, purposeRoleRows = purposeSource && lendPurposeStyleRows(purposeSource, result.blockStyles.dateStyles);
+    const purposeStyled = purposeRoleRows
+      ? lendStyledBlock(purposeBlock, purposeSource, purposeRoleRows, ["C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N"], [["date", 1]])
+      : { styled: purposeBlock.grid, merges: [] };
     summary.push(["Purpose Matchup paste block", "C1:N" + purposeBlock.last]);
     const hilLateFees = result.purpose.groups.find(group => group.code === "HIL")?.inputs["late-fees"];
     summary.push(["HIL late fees", hilLateFees == null ? "" : hilLateFees / 100],
       ["HIL late fees source", result.lateFees ? result.lateFees.source : hilLateFees == null ? "Not entered" : "Entered on the page"]);
-    sheets.push(["Purpose Matchup", worksheet("C1:N" + purposeBlock.last, [[3, 4, 14], [5, 5, 18], [6, 7, 14], [8, 8, 16], [9, 14, 14]], purposeRows.join(""))]);
+    sheets.push(["Purpose Matchup", worksheet("C1:N" + purposeBlock.last,
+      purposeRoleRows && purposeSource.cols.length ? purposeSource.cols : [[3, 4, 14], [5, 5, 18], [6, 7, 14], [8, 8, 16], [9, 14, 14]],
+      lendGridRows(purposeStyled.styled, row), purposeStyled.merges)]);
     const dollar = amount => amount == null ? "" : amount / 100;
     sheets.push(table("Carryover review", ["Product", "Type", "Prior amount", "New statement amount", "Suggested ACH rows", "Status"],
       groups.flatMap(group => group.candidates.map(item => [group.name, item.type, dollar(item.target),
@@ -1045,7 +1273,8 @@ async function buildLend(result) {
     sheets.push(["Cover Page inputs", worksheet("K10:AG19", [[11, 33, 15]], inputs.join(""))]);
   }
   return createExcelWorkbook([table("Summary", ["Field", "Value"], summary, [48, 54]), ...sheets,
-    ...completionPasteSheets(result.completion, audit)], audit);
+    ...completionPasteSheets(result.completion, audit)], audit,
+  result.blockStyles && { styles: result.blockStyles.stylesXml, theme: result.blockStyles.theme });
 }
 
 for (const kind of Object.keys(lendSources)) {
@@ -1165,6 +1394,8 @@ lendField("run").addEventListener("click", async () => {
     if (ach) lendAutoReviewProvider(ach, statementCash);
     const priorPurpose = lendSources.performance.book?.sheets.has("Purpose Matchup")
       ? lendPriorPurposeLabels(await readCells(lendSources.performance.book, "Purpose Matchup")) : undefined;
+    // Formatting is a convenience: if it cannot be read, the blocks are still produced with plain formatting.
+    const blockStyles = await lendReadBlockStyles(lendSources.performance.book).catch(() => undefined);
     if (wantsPerformance) {
       requireReport(lendSources.performance.book, "Load a readable performance workbook.");
       const book = lendSources.performance.book;
@@ -1194,7 +1425,7 @@ lendField("run").addEventListener("click", async () => {
     }
     const template = lendSources.performance.file;
     lendResult = { month, from, through, reverse: direction === "reverse", ach, performance, cover, purpose, portfolio, completion, statements, template,
-      statementCash, priorPurpose, lateFees,
+      statementCash, priorPurpose, lateFees, blockStyles,
       portfolioFile: portfolioSource?.file?.name,
       achFile: lendSources.ach.file?.name, fedFile: lendSources.fed.file?.name, performanceFile: lendSources.performance.file?.name,
       wisdomFile: lendSources.wisdom.file?.name };

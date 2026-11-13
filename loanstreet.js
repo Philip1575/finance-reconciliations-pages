@@ -271,13 +271,13 @@ function xmlText(value) {
 function excelOutputCells() {
   const label = (cell, value, style = 0) =>
     `<c r="${cell}" s="${style}" t="inlineStr"><is><t>${xmlText(value)}</t></is></c>`;
-  const number = (cell, value) => `<c r="${cell}" s="2"><v>${value}</v></c>`;
-  const date = (cell, value) => {
+  const number = (cell, value, style = 2) => `<c r="${cell}" s="${style}"><v>${value}</v></c>`;
+  const date = (cell, value, style = 3) => {
     if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value) || value < "1900-03-01") return label(cell, value);
     const timestamp = Date.parse(value + "T00:00:00Z");
     if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString().slice(0, 10) !== value) return label(cell, value);
     const serial = (timestamp - Date.UTC(1899, 11, 30)) / 86400000;
-    return `<c r="${cell}" s="3"><v>${serial}</v></c>`;
+    return `<c r="${cell}" s="${style}"><v>${serial}</v></c>`;
   };
   const row = (index, content) => `<row r="${index}">${content}</row>`;
   const worksheet = (range, columns, rows, merges = []) => `<worksheet xmlns="${spreadsheetNs}">
@@ -337,7 +337,42 @@ function completionPasteSheets(target, audit) {
     + row(3, label("A3", target.sheet) + label("B3", target.date) + label("C3", "Completed on") + date("D3", audit.on))) ]];
 }
 
-async function createExcelWorkbook(sheets, audit = reconciliationAudit()) {
+// Copies the cell formats a download borrows from an uploaded workbook (cells written with s="x<index>") into the
+// download's style sheet, renumbering fonts, fills, borders and formats. Returns the new style sheet parts and the
+// mapping from the uploaded workbook's format index to the download's.
+function borrowedExcelStyles(sourceXml, indices, base) {
+  const doc = new DOMParser().parseFromString(sourceXml, "application/xml");
+  requireReport(!doc.querySelector("parsererror"), "The workbook formatting could not be read.");
+  const serializer = new XMLSerializer();
+  const list = (parent, child) => Array.from(doc.getElementsByTagNameNS(spreadsheetNs, parent)[0]?.children ?? [])
+    .filter(node => node.localName === child);
+  const sources = { fontId: list("fonts", "font"), fillId: list("fills", "fill"), borderId: list("borders", "border") };
+  const formats = new Map(list("numFmts", "numFmt").map(node => [node.getAttribute("numFmtId"), node.getAttribute("formatCode")]));
+  const xfs = list("cellXfs", "xf");
+  const added = { fontId: [], fillId: [], borderId: [] }, renumbered = { fontId: new Map(), fillId: new Map(), borderId: new Map() };
+  const numFmts = new Map(), cellXfs = [], map = new Map();
+  for (const index of indices) {
+    const xf = xfs[index];
+    if (!xf) continue;
+    const copy = xf.cloneNode(true);
+    for (const key of ["fontId", "fillId", "borderId"]) {
+      const from = xf.getAttribute(key) ?? "0";
+      if (!renumbered[key].has(from)) {
+        renumbered[key].set(from, base[key] + added[key].length);
+        added[key].push(serializer.serializeToString(sources[key][Number(from)] ?? sources[key][0]));
+      }
+      copy.setAttribute(key, String(renumbered[key].get(from)));
+    }
+    const format = xf.getAttribute("numFmtId") ?? "0";
+    if (Number(format) >= 164 && formats.has(format)) numFmts.set(format, formats.get(format));
+    copy.setAttribute("xfId", "0");
+    cellXfs.push(serializer.serializeToString(copy));
+    map.set(index, base.xf + cellXfs.length - 1);
+  }
+  return { fonts: added.fontId, fills: added.fillId, borders: added.borderId, numFmts, cellXfs, map };
+}
+
+async function createExcelWorkbook(sheets, audit = reconciliationAudit(), styleSource) {
   const { label, date, row, worksheet } = excelOutputCells();
   sheets = [...sheets, ["Completion record", worksheet("A1:B2", [[1, 2, 23]],
     row(1, label("A1", "Completed by") + label("B1", audit.by))
@@ -348,18 +383,31 @@ async function createExcelWorkbook(sheets, audit = reconciliationAudit()) {
   zip.file("_rels/.rels", `<Relationships xmlns="${packageRelNs}">
     <Relationship Id="rId1" Type="${officeRelNs}/officeDocument" Target="xl/workbook.xml"/>
   </Relationships>`);
+  const borrowedIndices = [...new Set(sheets.flatMap(([, xml]) => [...xml.matchAll(/\ss="x(\d+)"/g)].map(match => Number(match[1]))))];
+  const borrowed = styleSource && borrowedIndices.length
+    ? borrowedExcelStyles(styleSource.styles, borrowedIndices, { fontId: 2, fillId: 3, borderId: 1, xf: 4 }) : undefined;
+  sheets = sheets.map(([name, xml]) => [name, xml.replace(/\ss="x(\d+)"/g, (_, index) => ` s="${borrowed?.map.get(Number(index)) ?? 0}"`)]);
+  const fonts = [`<font><sz val="11"/><name val="Calibri"/></font>`, `<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>`,
+    ...(borrowed?.fonts ?? [])];
+  const fills = [`<fill><patternFill patternType="none"/></fill>`, `<fill><patternFill patternType="gray125"/></fill>`,
+    `<fill><patternFill patternType="solid"><fgColor rgb="FF136B63"/><bgColor indexed="64"/></patternFill></fill>`, ...(borrowed?.fills ?? [])];
+  const borders = [`<border><left/><right/><top/><bottom/><diagonal/></border>`, ...(borrowed?.borders ?? [])];
+  const cellXfs = [`<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>`,
+    `<xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>`,
+    `<xf numFmtId="4" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`,
+    `<xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>`, ...(borrowed?.cellXfs ?? [])];
+  const numFmts = [...(borrowed?.numFmts ?? [])];
   zip.file("xl/styles.xml", `<styleSheet xmlns="${spreadsheetNs}">
-    <fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font></fonts>
-    <fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>
-    <fill><patternFill patternType="solid"><fgColor rgb="FF136B63"/><bgColor indexed="64"/></patternFill></fill></fills>
-    <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+    ${numFmts.length ? `<numFmts count="${numFmts.length}">${numFmts.map(([id, code]) => `<numFmt numFmtId="${id}" formatCode="${xmlText(code)}"/>`).join("")}</numFmts>` : ""}
+    <fonts count="${fonts.length}">${fonts.join("")}</fonts>
+    <fills count="${fills.length}">${fills.join("")}</fills>
+    <borders count="${borders.length}">${borders.join("")}</borders>
     <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-    <cellXfs count="4"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
-    <xf numFmtId="0" fontId="1" fillId="2" borderId="0" xfId="0" applyFont="1" applyFill="1"/>
-    <xf numFmtId="4" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/>
-    <xf numFmtId="14" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>
+    <cellXfs count="${cellXfs.length}">${cellXfs.join("")}</cellXfs>
     <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
   </styleSheet>`);
+  const theme = borrowed && styleSource.theme;
+  if (theme) zip.file("xl/theme/theme1.xml", theme);
   const parts = [];
   const names = [];
   const relations = [];
@@ -376,6 +424,7 @@ async function createExcelWorkbook(sheets, audit = reconciliationAudit()) {
     <Default Extension="xml" ContentType="application/xml"/>
     <Override PartName="/xl/workbook.xml" ContentType="${docType}.sheet.main+xml"/>
     <Override PartName="/xl/styles.xml" ContentType="${docType}.styles+xml"/>
+    ${theme ? `<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>` : ""}
     ${parts.join("")}
   </Types>`);
   zip.file("xl/workbook.xml", `<workbook xmlns="${spreadsheetNs}" xmlns:r="${officeRelNs}">
@@ -384,6 +433,7 @@ async function createExcelWorkbook(sheets, audit = reconciliationAudit()) {
   zip.file("xl/_rels/workbook.xml.rels", `<Relationships xmlns="${packageRelNs}">
     ${relations.join("")}
     <Relationship Id="styles" Type="${officeRelNs}/styles" Target="styles.xml"/>
+    ${theme ? `<Relationship Id="theme" Type="${officeRelNs}/theme" Target="theme/theme1.xml"/>` : ""}
   </Relationships>`);
   return zip.generateAsync({ type: "blob", mimeType: excelMime, compression: "DEFLATE" });
 }
