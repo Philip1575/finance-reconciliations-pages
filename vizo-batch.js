@@ -260,7 +260,8 @@ async function vbReadBook(file, knownGls) {
   // A statement-side in-transit line with an amount (Charge Cards: "Loanstreet In Transit Clearing").
   const clearingRow = [...Array(Math.max(0, ledgerRow - statementRow - 1)).keys()].map(k => statementRow + 1 + k)
     .find(r => typeof cover.get("L" + r) === "number" && ["C", "D", "E"].some(column => /transit/i.test(vbCellText(cover.get(column + r)))));
-  return { file, kind, title, gl, coverName, itemsToLedger, itemsSign, clearingRow, statementRow, ledgerRow, titleRow, items, templates, adjustedRow, transitRow,
+  const clearingNote = clearingRow && !cover.has("M" + (clearingRow - 1)) && !cover.has("M" + clearingRow);
+  return { file, kind, title, gl, coverName, itemsToLedger, itemsSign, clearingRow, clearingNote, statementRow, ledgerRow, titleRow, items, templates, adjustedRow, transitRow,
     statement: cents(cover.get("L" + statementRow) ?? 0), ledgerBalance: cents(cover.get("L" + ledgerRow) ?? 0), sheet };
 }
 
@@ -700,6 +701,9 @@ async function vbCovers(result) {
     const clearing = book.clearingRow && !book.items.length && item.newTransit.every(entry => entry.side === "Wisdom");
     if (clearing) {
       updates.push([sheet, "L" + book.clearingRow, null]);
+      // The script's figure beside it (Wisdom's month-end postings), for comparison only.
+      if (book.clearingNote) updates.push([sheet, "M" + (book.clearingRow - 1), "Number from script"],
+        [sheet, "M" + book.clearingRow, -item.newTransit.reduce((sum, entry) => sum + entry.amount, 0) / 100]);
       notes.push([book.title, result.month + "-01", "Cover " + sheet + "!L" + book.clearingRow, 0, "Enter the in-transit amount from the LoanStreet reconciliation (left blank and red)."
         + (item.newTransit.length ? " Wisdom's month-end postings total " + vbMoney.format(-item.newTransit.reduce((sum, entry) => sum + entry.amount, 0) / 100) + " for comparison." : "")]);
     }
