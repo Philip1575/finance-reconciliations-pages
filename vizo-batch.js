@@ -249,7 +249,7 @@ async function vbReadBook(file, knownGls) {
       if (!item.referenced.length) for (let up = scanFrom; up >= start && vizoText(up); up--) vizoRows.unshift(vizoText(up));
       const lastVizo = item.referenced.length ? Math.max(0, ...item.referenced.filter(vizoText)) || item.r : vizoText(scanFrom) ? scanFrom : item.r;
       // How the entry is laid out, so this month's block can write it the same way: the memo row relative to the group's
-      // last VIZO row, the G/L pair row relative to the memo, and the G/Ls exactly as written (734.2, 734200, "DR 734500").
+      // last VIZO row, the G/L pair row relative to the memo, and the G/Ls exactly as written (123.4, 123400 or "DR 123400").
       templates.push({ memo: vbCellText(cells.get(item.memoColumn + item.r)), dr: pair.dr, cr: pair.cr,
         amount: item.amountColumn ? cents(cells.get(item.amountColumn + item.r)) : undefined, signatures: [...new Set(vizoRows.map(vbSignature))], row: item.r,
         memoColumn: item.memoColumn, amountColumn: item.amountColumn, pairColumns: pair.columns, rawDr: cells.get(pair.columns[0] + pairRow),
