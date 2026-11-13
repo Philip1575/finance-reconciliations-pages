@@ -195,6 +195,7 @@ async function vbReadBook(file, knownGls) {
   const matchups = sheetNames.filter(name => /^matchup\s+[a-z]+\s+\d{2,4}/i.test(name.trim()));
   const sheet = matchups[0] ?? sheetNames[1];
   const templates = [];
+  let layout;
   if (sheet) {
     const formulas = new Map();
     const cells = await readCells(book, sheet, formulas);
@@ -244,11 +245,53 @@ async function vbReadBook(file, knownGls) {
       // The VIZO rows the entry covers: the rows its formula points to, or else the contiguous VIZO rows ending on the
       // pair's row.
       const vizoRows = item.referenced.map(vizoText).filter(Boolean);
-      if (!item.referenced.length) for (let up = vizoText(pairRow) ? pairRow : item.r; up >= start && vizoText(up); up--) vizoRows.unshift(vizoText(up));
+      const scanFrom = vizoText(pairRow) ? pairRow : item.r;
+      if (!item.referenced.length) for (let up = scanFrom; up >= start && vizoText(up); up--) vizoRows.unshift(vizoText(up));
+      const lastVizo = item.referenced.length ? Math.max(0, ...item.referenced.filter(vizoText)) || item.r : vizoText(scanFrom) ? scanFrom : item.r;
+      // How the entry is laid out, so this month's block can write it the same way: the memo row relative to the group's
+      // last VIZO row, the G/L pair row relative to the memo, and the G/Ls exactly as written (734.2, 734200, "DR 734500").
       templates.push({ memo: vbCellText(cells.get(item.memoColumn + item.r)), dr: pair.dr, cr: pair.cr,
-        amount: item.amountColumn ? cents(cells.get(item.amountColumn + item.r)) : undefined, signatures: [...new Set(vizoRows.map(vbSignature))], row: item.r });
+        amount: item.amountColumn ? cents(cells.get(item.amountColumn + item.r)) : undefined, signatures: [...new Set(vizoRows.map(vbSignature))], row: item.r,
+        memoColumn: item.memoColumn, amountColumn: item.amountColumn, pairColumns: pair.columns, rawDr: cells.get(pair.columns[0] + pairRow),
+        rawCr: cells.get(pair.columns[1] + pairRow), pairOffset: pairRow - item.r, memoOffset: Math.max(0, item.r - lastVizo) });
     }
     templates.sort((a, b) => a.row - b.row);
+    // The latest month block's layout (two-sided worksheets; ATM's monthly matchup sheet is handled separately).
+    const headRow = block.find(r => r > start && columnsOf(r).some(column => /^date$/i.test(vbCellText(cells.get(column + r)))));
+    if (!matchups[0] && heads.length && headRow) {
+      const named = columnsOf(headRow).map(column => [column, vbCellText(cells.get(column + headRow)).toLowerCase()]);
+      const find = (name, after = "") => named.find(([column, text]) => text === name && columnNumber(column) > columnNumber(after || "@"))?.[0];
+      const vizo = { date: find("date") }; vizo.desc = find("description", vizo.date); vizo.amount = find("amount", vizo.desc);
+      const wisdom = { date: find("date", vizo.amount) }; wisdom.desc = find("description", wisdom.date);
+      wisdom.amount = wisdom.desc && csvColumn(columnNumber(wisdom.desc) + 1);
+      if (vizo.date && vizo.desc && vizo.amount && wisdom.date && wisdom.desc) {
+        const check = columnNumber(wisdom.date) - columnNumber(vizo.amount) > 1 ? csvColumn(columnNumber(vizo.amount) + 1) : undefined;
+        const entryRows = new Set(templates.flatMap(item => [item.row, item.row + item.pairOffset]));
+        const roles = { title: start, head: headRow, vizo: [], entry: [...entryRows].filter(r => r === Math.trunc(r)), wisdom: [], check: [] };
+        const order = new Map();
+        for (const r of block.filter(r => r > headRow)) {
+          const text = vbCellText(cells.get(vizo.desc + r));
+          if (vbIsVizoText(text) && !order.has(vbSignature(text))) order.set(vbSignature(text), r);
+          if (check && formulas.has(check + r)) roles.check.push(r);
+          else if (vbIsVizoText(text) && !entryRows.has(r)) roles.vizo.push(r);
+          else if (!vbIsVizoText(text) && vbCellText(cells.get(wisdom.desc + r)) && !entryRows.has(r)) roles.wisdom.push(r);
+        }
+        const before = rows.filter(r => r < start);
+        // Rows of the block itself (stray cells far to the right or below are ignored), and where this month's block goes.
+        const reach = columnNumber(wisdom.amount) + 3;
+        const content = block.filter(r => columnsOf(r).some(column => columnNumber(column) <= reach && vbCellText(cells.get(column + r)) !== ""));
+        const lastColumn = Math.max(...content.flatMap(r => columnsOf(r).map(columnNumber).filter(n => n <= reach + 2)));
+        const orderText = new Map();
+        for (const r of content) {
+          const text = vbCellText(cells.get(vizo.desc + r));
+          if (vbIsVizoText(text) && !orderText.has(text)) orderText.set(text, r);
+        }
+        layout = { start, gap: Math.min(1, before.length ? start - before.at(-1) - 1 : 1), after: Math.max(...content), headRow, vizo, wisdom, check, roles, order, orderText,
+          title: columnsOf(start).map(column => [column, cells.get(column + start)]), head: columnsOf(headRow).map(column => [column, cells.get(column + headRow)]),
+          columns: Array.from({ length: Math.max(lastColumn, columnNumber(wisdom.amount) + 3) }, (_, k) => csvColumn(k + 1)),
+          format: (await readWorkbookFormatting(book, [sheet]))?.sheets[sheet] };
+      }
+    }
   }
   // Whether the cover adds its in-transit items to the G/L balance (Adjusted Book Balance = SUM from the G/L row).
   const adjustedFormula = adjustedRow && coverFormulas.get("L" + adjustedRow);
@@ -261,8 +304,22 @@ async function vbReadBook(file, knownGls) {
   const clearingRow = [...Array(Math.max(0, ledgerRow - statementRow - 1)).keys()].map(k => statementRow + 1 + k)
     .find(r => typeof cover.get("L" + r) === "number" && ["C", "D", "E"].some(column => /transit/i.test(vbCellText(cover.get(column + r)))));
   const clearingNote = clearingRow && !cover.has("M" + (clearingRow - 1)) && !cover.has("M" + clearingRow);
-  return { file, kind, title, gl, coverName, itemsToLedger, itemsSign, clearingRow, clearingNote, statementRow, ledgerRow, titleRow, items, templates, adjustedRow, transitRow,
-    statement: cents(cover.get("L" + statementRow) ?? 0), ledgerBalance: cents(cover.get("L" + ledgerRow) ?? 0), sheet };
+  // The cover's G/L shortcut table (payee, debit G/L, credit G/L), used for payees with no entry last month.
+  const shortcuts = [];
+  const shortcutCell = [...cover].find(([, value]) => /^g\/l shortcut$/i.test(vbCellText(value)));
+  if (shortcutCell) {
+    const [, nameColumn, headerRow] = /^([A-Z]+)(\d+)$/.exec(shortcutCell[0]);
+    const right = n => csvColumn(columnNumber(nameColumn) + n);
+    if (/^debit$/i.test(vbCellText(cover.get(right(1) + headerRow))) && /^credit$/i.test(vbCellText(cover.get(right(2) + headerRow)))) {
+      for (let r = Number(headerRow) + 1; r < Number(headerRow) + 60; r++) {
+        const name = vbCellText(cover.get(nameColumn + r)), rawDr = cover.get(right(1) + r), rawCr = cover.get(right(2) + r);
+        if (name && vbGl(rawDr) && vbGl(rawCr)) shortcuts.push({ name, dr: vbGl(rawDr), cr: vbGl(rawCr), rawDr, rawCr });
+      }
+    }
+  }
+  return { file, kind, title, gl, coverName, itemsToLedger, itemsSign, clearingRow, clearingNote, shortcuts, statementRow, ledgerRow, titleRow, items, templates, adjustedRow, transitRow,
+    statement: cents(cover.get("L" + statementRow) ?? 0), ledgerBalance: cents(cover.get("L" + ledgerRow) ?? 0),
+    clearingAmount: clearingRow ? cents(cover.get("L" + clearingRow)) : undefined, sheet, layout };
 }
 
 // The memo of a learned entry with this month's date in place of last month's (08/26 → 09/26, 8/26 → 9/26).
@@ -350,8 +407,9 @@ function vbMatch(vizoRows, wisdomRows) {
     const vizoPool = open.vizo.filter(other => near(other, 0, 3)).slice(0, 10);
     const wisdomPool = open.wisdom.filter(other => near(other, 6, 3)).slice(0, 10);
     const sums = new Map();
-    for (const group of subsets(wisdomPool, 3)) { const key = total(group); if (!sums.has(key)) sums.set(key, group); }
-    const found = subsets(vizoPool, 3, item).find(group => group.length + (sums.get(total(group))?.length ?? 9) > 2 && sums.has(total(group)));
+    for (const group of subsets(wisdomPool, 3)) { const key = total(group); if (!sums.has(key) || sums.get(key).length > group.length) sums.set(key, group); }
+    const found = subsets(vizoPool, 3, item).filter(group => group.length + (sums.get(total(group))?.length ?? 9) > 2 && sums.has(total(group)))
+      .sort((a, b) => a.length - b.length)[0];
     if (!found) continue;
     const others = sums.get(total(found));
     take(found, others);
@@ -371,7 +429,8 @@ function vbMatch(vizoRows, wisdomRows) {
   for (const group of categories.values()) {
     if (group.length < 2) continue;
     const pool = open.wisdom.slice(0, 30);
-    const found = subsets(pool, 4).find(others => total(others) === total(group));
+    // The fewest postings that add up (so unrelated postings that net to zero are not pulled in).
+    const found = subsets(pool, 4).filter(others => total(others) === total(group)).sort((a, b) => a.length - b.length)[0];
     if (!found) continue;
     take(group, found);
     take(found, group);
@@ -415,7 +474,7 @@ function vbReconcile({ month, vizo, wisdom, books, invoice }) {
   const entries = [], review = [], transit = [];
   const templatesFor = kind => byKind.get(kind)?.book?.templates ?? [];
   const allTemplates = accounts.flatMap(account => (account.book?.templates ?? []).map(item => ({ ...item, kind: account.kind })));
-  const addReview = (account, item, reason) => review.push({ account, date: item?.date ?? monthEnd, description: item?.description ?? "", amount: item?.amount ?? 0, reason });
+  const addReview = (account, item, reason) => review.push({ account, item, date: item?.date ?? monthEnd, description: item?.description ?? "", amount: item?.amount ?? 0, reason });
 
   // Internal activity between the VIZO accounts: overdraft sweeps, transfers and interest sweeps.
   const internal = [];
@@ -549,6 +608,41 @@ function vbReconcile({ month, vizo, wisdom, books, invoice }) {
         for (const item of items) account.cleared.push({ item, rows: [row] });
       }
     }
+    // Last month's statement-side clearing line (Charge Cards: LoanStreet in transit) clears when this month's deposits of
+    // one kind add up to it.
+    const clearingAmount = account.book?.clearingAmount;
+    if (clearingAmount) {
+      const kinds = new Map();
+      for (const item of match.vizo.filter(item => item.amount > 0)) {
+        const key = vbSignature(item.description).split(" ").slice(0, 3).join(" ");
+        kinds.set(key, [...(kinds.get(key) ?? []), item]);
+      }
+      const rows = [...kinds.values()].find(list => list.reduce((sum, item) => sum + item.amount, 0) === clearingAmount);
+      if (rows) {
+        for (const row of rows) match.vizo.splice(match.vizo.indexOf(row), 1);
+        account.cleared.push({ item: { description: "Last month's in transit clearing", amount: -(account.book.itemsSign ?? 1) * clearingAmount }, rows });
+      }
+    }
+    // Payments to payees in the cover's G/L shortcut table (one with no entry last month) become entries with those G/Ls.
+    const shortcuts = account.book?.shortcuts ?? [];
+    const memoStyle = templatesFor(account.kind).map(template => /^(\S+)\s+(CC\s+)?(\d{1,2}\/\d{2})$/i.exec(template.memo)).find(Boolean);
+    const byPayee = new Map();
+    for (const item of [...match.vizo]) {
+      if (item.amount >= 0) continue;
+      const tokens = item.description.toUpperCase().match(/[A-Z]{4,}/g) ?? [];
+      const shortcut = shortcuts.find(entry => {
+        const first = entry.name.toUpperCase().match(/[A-Z]+/)?.[0] ?? "";
+        return first.length >= 4 && tokens.some(token => first.startsWith(token) || token.startsWith(first));
+      });
+      if (!shortcut) continue;
+      match.vizo.splice(match.vizo.indexOf(item), 1);
+      byPayee.set(shortcut, [...(byPayee.get(shortcut) ?? []), item]);
+    }
+    for (const [shortcut, rows] of byPayee) {
+      const suffix = memoStyle ? " " + (memoStyle[2] ? "CC " : "") + vbMemo(memoStyle[3], month) : " " + month.slice(5) + "/" + month.slice(2, 4);
+      entries.push({ account: account.kind, date: monthEnd, memo: shortcut.name.toUpperCase().split(/\s+/)[0] + suffix, amount: -rows.reduce((sum, item) => sum + item.amount, 0),
+        dr: shortcut.dr, cr: shortcut.cr, rawDr: shortcut.rawDr, rawCr: shortcut.rawCr, rows, basis: rows.length + " VIZO rows paid to " + shortcut.name + " (cover G/L shortcut)" });
+    }
     for (const item of match.vizo) {
       if (item.date >= window.from && ["SETTLEMENT", "ATM"].includes(account.kind)) transit.push({ account: account.kind, item, amount: item.amount, description: item.description, side: "VIZO" });
       else addReview(account.kind, item, "VIZO activity not in Wisdom and no entry like it last month");
@@ -651,34 +745,227 @@ function vbShow(result) {
   vbField("results").hidden = false;
 }
 
-// Gives cells a red fill (keeping their other formatting): inputs the preparer still has to make.
-async function vbRedCells(blob, name, sheet, addresses) {
+// This month's block for a two-sided worksheet (VIZO rows on the left, Wisdom rows or the entry on the right), laid out
+// and formatted like last month's block: VIZO rows grouped by kind in last month's order, each entry on the group's last
+// VIZO row with its debit and credit G/Ls written as last month wrote them, a check formula on matched groups, then
+// in-transit and open Wisdom items. Entries still to make are yellow and items to review red.
+function vbBlock(result, item) {
+  const account = item.account, book = account.book, layout = book?.layout;
+  if (!layout?.format) return undefined;
+  const { vizo: V, wisdom: Wc, check } = layout;
+  const [year, monthNumber] = result.month.split("-");
+  const retitle = value => typeof value === "string" ? value.replace(/\b(\d{1,2})([-/])(\d{2})\b/g,
+    (all, m, separator) => (m.length === 2 ? monthNumber : String(Number(monthNumber))) + separator + year.slice(2)) : value;
+  if (layout.title.some(([, value]) => typeof value === "string" && /\d/.test(value) && retitle(value) === value)) return { already: true };
+  const serial = iso => (Date.parse(iso + "T00:00:00Z") - Date.UTC(1899, 11, 30)) / 86400000;
+  const monthEnd = vbTransitWindow(result.month).to;
+  const grid = new Map(), roles = new Map(), cellRoles = new Map(), marks = [];
+  const put = (r, column, xml) => { const cells = grid.get(r) ?? new Map(); cells.set(column, xml); grid.set(r, cells); };
+  const text = (r, column, value) => put(r, column, `<c r="${column}${r}" s="0" t="inlineStr"><is><t xml:space="preserve">${xmlText(value)}</t></is></c>`);
+  const number = (r, column, value) => put(r, column, `<c r="${column}${r}" s="0"><v>${value}</v></c>`);
+  const formula = (r, column, expression, value) => put(r, column, `<c r="${column}${r}" s="0"><f>${xmlText(expression)}</f><v>${value}</v></c>`);
+  const raw = (r, column, value) => value === undefined || value === null ? undefined : typeof value === "number" ? number(r, column, value) : text(r, column, String(value));
+  const date = (r, column, value) => typeof value === "number" ? number(r, column, value)
+    : /^\d{4}-\d{2}-\d{2}$/.test(value ?? "") ? number(r, column, serial(value)) : value ? text(r, column, String(value)) : undefined;
+  const span = (column, a, b) => a === b ? column + a : "SUM(" + column + a + ":" + column + b + ")";
+  const mark = (r, columns, color) => { for (const column of columns) marks.push({ row: r, column, color }); };
+  const yellow = "FFFFFF00", red = "FFFF7C80";
+
+  const rows = account.vizo?.rows ?? [];
+  const used = new Set();
+  const groups = [];
+  const words = value => vbCellText(value).toUpperCase().replace(/\d+\/\d+/g, "").replace(/[^A-Z]+/g, " ").trim();
+  // Last month's entry with the same memo and G/Ls; a payee from the cover's shortcut table borrows a plain entry's layout.
+  const glText = (gl, sample) => typeof sample === "string" ? sample.replace(/\d[\d.]*/, gl)
+    : typeof sample === "number" && sample < 1000 ? Number(gl.slice(0, 3) + "." + gl.slice(3)) : Number(gl);
+  const templateFor = entry => {
+    const exact = book.templates.find(t => words(t.memo) === words(entry.memo) && t.dr === entry.dr && t.cr === entry.cr);
+    if (exact || entry.rawDr === undefined) return exact;
+    const base = book.templates.find(t => t.memoOffset === 0 && t.pairOffset === 0) ?? book.templates[0];
+    return base && { ...base, rawDr: entry.rawDr ?? glText(entry.dr, base.rawDr), rawCr: entry.rawCr ?? glText(entry.cr, base.rawCr) };
+  };
+  // Entries: the account's own rows, or its side of an overdraft sweep or transfer booked from another account.
+  const rowsFor = entry => rows.filter(row => entry.rows.includes(row) || entry.rows.some(other => other.paired === row));
+  const entryGroups = new Map();
+  for (const entry of result.entries) {
+    if (entry.account !== account.kind && /interest/i.test(entry.basis)) continue;
+    const own = rowsFor(entry);
+    if (!own.length) continue;
+    const key = own.map(row => rows.indexOf(row)).join(",");
+    const group = entryGroups.get(key) ?? { vizo: [...own].sort((a, b) => a.date.localeCompare(b.date)), wisdom: [], entries: [] };
+    group.entries.push(entry);
+    entryGroups.set(key, group);
+  }
+  for (const group of entryGroups.values()) { groups.push(group); group.vizo.forEach(row => used.add(row)); }
+  // Last month's in-transit items cleared this month, shown against the cover item they cleared.
+  const pseudo = new Map();
+  for (const { item: cleared, rows: clearing } of account.cleared ?? []) {
+    if (!clearing.every(row => row.side === "VIZO")) continue;
+    const description = cleared.description || cleared.clears || "Last month's in transit";
+    const entry = { date: typeof cleared.date === "number" ? cleared.date : undefined, description: String(description), amount: -(book.itemsSign ?? 1) * cleared.amount };
+    for (const row of clearing) pseudo.set(row, [...(pseudo.get(row) ?? []), entry]);
+  }
+  const bySignature = new Map();
+  // Rows are grouped by payee (CUSIP activity together; a payee's deposits apart from its withdrawals).
+  const payeeKey = description => {
+    const full = vbCellText(description);
+    const payee = full.replace(/^(external|descriptive)\s+(deposit|withdrawal)\s*/i, "").split(" - ")[0];
+    const words = payee.toUpperCase().split(/\s+/).filter(word => /^[A-Z]{2,}$/.test(word)).slice(0, 4);
+    return words.length > 1 ? vbSignature(full).split(" ")[0] + " " + words.join(" ") : words.join(" ") || vbSignature(full);
+  };
+  const groupOf = (row, label, interest) => {
+    const key = interest ? "interest" : (label ?? "") + "|" + payeeKey(row.description);
+    const group = bySignature.get(key) ?? { vizo: [], wisdom: [], entries: [], label: label === "review" ? undefined : label, review: label === "review" };
+    bySignature.set(key, group);
+    return group;
+  };
+  const transitRows = new Set(result.transit.filter(entry => entry.account === account.kind && ["VIZO", "Wisdom"].includes(entry.side)).map(entry => entry.item));
+  const reviewRows = new Set(result.review.filter(entry => entry.account === account.kind).map(entry => entry.item).filter(Boolean));
+  for (const row of rows) {
+    if (used.has(row)) continue;
+    const partners = account.match?.matched.get(row) ?? pseudo.get(row);
+    const interest = ["INT", "INTCREDIT"].includes(row.class?.type);
+    const group = groupOf(row, interest || partners ? undefined : transitRows.has(row) ? "Intransit" : "review", interest);
+    group.vizo.push(row);
+    for (const other of partners ?? []) if (!group.wisdom.includes(other)) group.wisdom.push(other);
+  }
+  for (const group of bySignature.values()) {
+    group.vizo.sort((a, b) => a.date.localeCompare(b.date));
+    group.wisdom.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    groups.push(group);
+  }
+  const order = group => {
+    const signature = group.vizo[0] ? vbSignature(group.vizo[0].description) : undefined;
+    return group.review || group.label ? 1e6 : layout.orderText.get(group.vizo[0]?.description) ?? layout.order.get(signature) ?? 1e5;
+  };
+  groups.sort((a, b) => order(a) - order(b));
+  // Wisdom-only items: month-end postings in transit, open items and same-day reversals.
+  const ledgerRows = account.ledger?.rows ?? [];
+  const transitWisdom = ledgerRows.filter(row => transitRows.has(row));
+  const other = ledgerRows.filter(row => !transitRows.has(row) && reviewRows.has(row));
+  // A cover that carries month-end postings on one clearing line (entered by hand) does not list them in the block.
+  if (transitWisdom.length && !(book.clearingRow && !book.items.length)) groups.push({ vizo: [], wisdom: transitWisdom, entries: [], label: "Intransit" });
+  if (other.length) groups.push({ vizo: [], wisdom: other, entries: [], review: true });
+
+  let r = 1 + layout.gap;
+  for (const [column, value] of layout.title) raw(r, column, retitle(value));
+  roles.set(r++, "title");
+  for (const [column, value] of layout.head) raw(r, column, value);
+  roles.set(r++, "head");
+  for (const group of groups) {
+    const first = r, count = Math.max(group.vizo.length, group.wisdom.length, 1);
+    group.vizo.forEach((row, k) => {
+      date(first + k, V.date, row.date); text(first + k, V.desc, row.description); number(first + k, V.amount, row.amount / 100);
+      if (group.review) mark(first + k, [V.date, V.desc, V.amount], red);
+    });
+    group.wisdom.forEach((row, k) => {
+      date(first + k, Wc.date, row.date); text(first + k, Wc.desc, row.description); number(first + k, Wc.amount, row.amount / 100);
+      if (group.review) mark(first + k, [Wc.date, Wc.desc, Wc.amount], red);
+    });
+    for (let k = 0; k < count; k++) roles.set(first + k, group.vizo[k] || !group.wisdom[k] ? "vizo" : "wisdom");
+    let last = first + count - 1;
+    const sumVizo = group.vizo.reduce((sum, row) => sum + row.amount, 0);
+    if (group.label && check) { text(first, check, group.label); cellRoles.set(check + first, "check"); }
+    if (group.vizo.length && group.wisdom.length && check) {
+      const sumWisdom = group.wisdom.reduce((sum, row) => sum + row.amount, 0);
+      formula(last, check, "SUM(" + V.amount + first + ":" + V.amount + (first + group.vizo.length - 1) + ")-SUM(" + Wc.amount + first + ":" + Wc.amount + (first + group.wisdom.length - 1) + ")",
+        (sumVizo - sumWisdom) / 100);
+      cellRoles.set(check + last, "check");
+    }
+    const lastVizo = first + Math.max(group.vizo.length, 1) - 1;
+    group.entries.forEach((entry, i) => {
+      const template = templateFor(entry);
+      const memoRow = lastVizo + (template?.memoOffset ?? 0) + i;
+      const memoColumn = template?.memoColumn ?? Wc.desc, amountColumn = template?.amountColumn ?? Wc.amount;
+      date(memoRow, Wc.date, monthEnd);
+      text(memoRow, memoColumn, entry.memo);
+      const whole = group.entries.length === 1 && Math.abs(sumVizo) === entry.amount && group.vizo.length > 0;
+      if (whole) formula(memoRow, amountColumn, span(V.amount, first, first + group.vizo.length - 1), sumVizo / 100);
+      else number(memoRow, amountColumn, entry.amount / 100);
+      const cells = [Wc.date, memoColumn, amountColumn];
+      const color = entry.status === "Review" ? red : entry.status === "To make" ? yellow : undefined;
+      if (template) {
+        const pairRow = memoRow + template.pairOffset;
+        raw(pairRow, template.pairColumns[0], template.rawDr);
+        raw(pairRow, template.pairColumns[1], template.rawCr);
+        for (const column of template.pairColumns) cellRoles.set(column + pairRow, "entry");
+        if (pairRow === memoRow) cells.push(...template.pairColumns);
+        else if (color) mark(pairRow, template.pairColumns, color);
+        if (!roles.has(pairRow)) roles.set(pairRow, "vizo");
+        last = Math.max(last, pairRow);
+      } else if (whole && check && !group.wisdom.length) {
+        formula(memoRow, check, span(V.amount, first, first + group.vizo.length - 1) + "-" + amountColumn + memoRow, 0);
+        cellRoles.set(check + memoRow, "check");
+      }
+      for (const column of cells) cellRoles.set(column + memoRow, "entry");
+      if (color) mark(memoRow, cells, color);
+      if (!roles.has(memoRow)) roles.set(memoRow, "vizo");
+      last = Math.max(last, memoRow);
+    });
+    r = last + 2;
+  }
+  const end = r - 2;
+  const source = layout.roles;
+  const roleRows = { title: source.title, head: source.head };
+  for (const name of ["vizo", "entry", "wisdom", "check"]) if (source[name].length) roleRows[name] = source[name];
+  roleRows.entry ??= roleRows.vizo; roleRows.wisdom ??= roleRows.vizo; roleRows.check ??= roleRows.vizo;
+  const styled = styledBlock({ grid, roles, cellRoles }, layout.format, roleRows, layout.columns, []);
+  return { append: { sheet: book.sheet, grid: styled.styled, merges: styled.merges, heights: styled.heights, end, after: layout.after }, marks };
+}
+
+// Gives cells a solid fill (keeping their other formatting): yellow for entries to make, red for inputs and review.
+async function vbFillCells(blob, name, marks) {
   const workbook = await openExcel(new File([blob], name), true);
   const serializer = new XMLSerializer();
   const styles = await readXml(workbook.zip, "xl/styles.xml");
   const list = tag => styles.getElementsByTagNameNS(spreadsheetNs, tag)[0];
   const fills = list("fills"), xfs = list("cellXfs");
-  const fill = styles.createElementNS(spreadsheetNs, fills.prefix ? fills.prefix + ":fill" : "fill");
-  fill.innerHTML = '<patternFill xmlns="' + spreadsheetNs + '" patternType="solid"><fgColor rgb="FFFF0000"/><bgColor indexed="64"/></patternFill>';
-  fills.append(fill);
-  fills.setAttribute("count", String(fills.children.length));
-  const target = excelWorksheetPath(workbook, sheet);
-  const doc = await readXml(workbook.zip, target);
-  const cells = new Map(Array.from(doc.getElementsByTagNameNS(spreadsheetNs, "c"), cell => [cell.getAttribute("r"), cell]));
-  for (const address of addresses) {
-    const cell = cells.get(address);
-    requireReport(cell, "Missing cover cell " + sheet + "!" + address + ".");
-    const xf = Array.from(xfs.children)[Number(cell.getAttribute("s") ?? 0)].cloneNode(true);
-    xf.setAttribute("fillId", String(fills.children.length - 1));
-    xf.setAttribute("applyFill", "1");
-    xfs.append(xf);
-    xfs.setAttribute("count", String(xfs.children.length));
-    cell.setAttribute("s", String(xfs.children.length - 1));
+  const fillIds = new Map(), xfIds = new Map();
+  const fillFor = color => {
+    if (!fillIds.has(color)) {
+      const fill = styles.createElementNS(spreadsheetNs, fills.prefix ? fills.prefix + ":fill" : "fill");
+      fill.innerHTML = '<patternFill xmlns="' + spreadsheetNs + '" patternType="solid"><fgColor rgb="' + color + '"/><bgColor indexed="64"/></patternFill>';
+      fills.append(fill);
+      fills.setAttribute("count", String(fills.children.length));
+      fillIds.set(color, fills.children.length - 1);
+    }
+    return fillIds.get(color);
+  };
+  const sheets = new Map();
+  for (const markItem of marks) sheets.set(markItem.sheet, [...(sheets.get(markItem.sheet) ?? []), markItem]);
+  for (const [sheet, items] of sheets) {
+    const target = excelWorksheetPath(workbook, sheet);
+    const doc = await readXml(workbook.zip, target);
+    const rowNodes = new Map(Array.from(doc.getElementsByTagNameNS(spreadsheetNs, "row"), row => [row.getAttribute("r"), row]));
+    const cells = new Map(Array.from(doc.getElementsByTagNameNS(spreadsheetNs, "c"), cell => [cell.getAttribute("r"), cell]));
+    for (const { address, color } of items) {
+      let cell = cells.get(address);
+      if (!cell) {
+        const [, column, rowNumber] = /^([A-Z]+)(\d+)$/.exec(address);
+        const parent = rowNodes.get(rowNumber);
+        if (!parent) continue;
+        cell = doc.createElementNS(spreadsheetNs, parent.prefix ? parent.prefix + ":c" : "c");
+        cell.setAttribute("r", address);
+        parent.insertBefore(cell, Array.from(parent.children).find(child => columnNumber((child.getAttribute("r") ?? "").replace(/\d+$/, "")) > columnNumber(column)) ?? null);
+        cells.set(address, cell);
+      }
+      const key = (cell.getAttribute("s") ?? "0") + "|" + color;
+      if (!xfIds.has(key)) {
+        const xf = Array.from(xfs.children)[Number(cell.getAttribute("s") ?? 0)].cloneNode(true);
+        xf.setAttribute("fillId", String(fillFor(color)));
+        xf.setAttribute("applyFill", "1");
+        xfs.append(xf);
+        xfs.setAttribute("count", String(xfs.children.length));
+        xfIds.set(key, xfs.children.length - 1);
+      }
+      cell.setAttribute("s", String(xfIds.get(key)));
+    }
+    workbook.zip.file(target, serializer.serializeToString(doc));
   }
   workbook.zip.file("xl/styles.xml", serializer.serializeToString(styles));
-  workbook.zip.file(target, serializer.serializeToString(doc));
   return workbook.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
 }
+
 
 // Each account's workbook with the cover's month, statement and Wisdom balances (after the entries) and the in-transit
 // list: last month's open items that did not clear, then this month's new items. A cover without enough item rows keeps
@@ -715,16 +1002,31 @@ async function vbCovers(result) {
     const itemUpdates = rows.length >= lines.length ? rows.flatMap((row, k) => ["F", "I", "K", "L", "M"].map((column, c) =>
       [sheet, column + row, lines[k]?.[c] ?? null])) : [];
     const name = book.file.name.replace(/^\d{1,2}[.-]\d{2}/, String(Number(result.month.slice(5))) + "." + result.month.slice(2, 4));
+    // This month's worksheet block, appended below last month's.
+    let block;
+    try { block = vbBlock(result, item); } catch (error) { notes.push([book.title, result.month + "-01", "Worksheet block", 0, "The month block could not be built: " + error.message]); }
+    if (block?.already) notes.push([book.title, result.month + "-01", "Worksheet block", 0, "The worksheet already has this month's block; none was added."]);
+    const appends = block?.append ? [block.append] : [];
+    const finish = async (blob, withBlock) => {
+      const marks = clearing ? [{ sheet, address: "L" + book.clearingRow, color: "FFFF0000" }] : [];
+      if (withBlock && block.append.startRow) for (const markItem of block.marks) {
+        marks.push({ sheet: book.sheet, address: markItem.column + (block.append.startRow + markItem.row - 1), color: markItem.color });
+      }
+      return marks.length ? vbFillCells(blob, book.file.name, marks) : blob;
+    };
+    const fill = async items => {
+      try { return await finish(await fillExcelTemplate(book.file, items, appends), appends.length > 0); } catch (error) {
+        if (!appends.length) throw error;
+        notes.push([book.title, result.month + "-01", "Worksheet block", 0, "The month block could not be added: " + error.message]);
+        return finish(await fillExcelTemplate(book.file, items), false);
+      }
+    };
     let blob;
     try {
-      blob = await fillExcelTemplate(book.file, [...updates, ...itemUpdates]);
-      if (clearing) blob = await vbRedCells(blob, book.file.name, sheet, ["L" + book.clearingRow]);
+      blob = await fill([...updates, ...itemUpdates]);
       if (!itemUpdates.length && lines.length + book.items.length) throw new Error("not enough item rows");
     } catch (error) {
-      if (!blob) {
-        blob = await fillExcelTemplate(book.file, updates);
-        if (clearing) blob = await vbRedCells(blob, book.file.name, sheet, ["L" + book.clearingRow]);
-      }
+      blob ??= await fill(updates);
       notes.push([book.title, result.month + "-01", "Cover in-transit list", 0, "The cover keeps last month's in-transit list: add " + lines.length
         + " items (" + (rows.length < lines.length ? "the list has " + rows.length + " rows" : error.message) + ")."]);
     }

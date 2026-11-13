@@ -259,7 +259,7 @@ function appendTemplateBlock(doc, block, styleFor) {
     .map(row => Number(row.getAttribute("r")));
   const mergeCells = doc.getElementsByTagNameNS(spreadsheetNs, "mergeCells")[0];
   const mergeEnds = Array.from(mergeCells?.children ?? []).map(node => Number(/(\d+)$/.exec(node.getAttribute("ref") ?? "")?.[1] ?? 0));
-  const offset = Math.max(0, ...used, ...mergeEnds);
+  const offset = block.after ?? Math.max(0, ...used, ...mergeEnds);
   const shiftRef = text => text.replace(/(\$?)([A-Z]{1,3})(\$?)(\d+)(?![\d(])/g,
     (all, colAbs, column, rowAbs, row) => rowAbs ? all : colAbs + column + (Number(row) + offset));
   const shiftCell = xml => xml
