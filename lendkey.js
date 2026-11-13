@@ -595,10 +595,16 @@ function lendLineupStyleRows({ cells, merges }) {
   // Use the latest complete block: titles preceded by the month-end date band merged across C:S (rows above the title).
   const titles = rows.filter(r => text("C" + r) === "ACH TRANSACTIONS");
   const bands = merges.filter(m => m.c1 === "C" && m.c2 === "S" && m.r2 > m.r1);
+  // The monthly header row has headings only through column R; a block with extra columns (Basis, Fed date and similar)
+  // was not prepared in the monthly layout, so its formatting is not copied.
+  const standardHeader = r => ![...cells.keys()].some(address => {
+    const match = /^([A-Z]+)(\d+)$/.exec(address);
+    return match && Number(match[2]) === r && columnNumber(match[1]) > columnNumber("R") && String(cells.get(address) ?? "").trim();
+  });
   let title, date;
   for (let i = titles.length - 1; i >= 0 && !title; i--) {
     const band = bands.find(m => m.r2 < titles[i] && m.r2 >= titles[i] - 2);
-    if (band) [title, date] = [titles[i], band.r1];
+    if (band && standardHeader(titles[i] + 1)) [title, date] = [titles[i], band.r1];
   }
   if (!title) return undefined;
   const nextBand = bands.map(m => m.r1).filter(r => r > title).sort((a, b) => a - b)[0] ?? Infinity;
