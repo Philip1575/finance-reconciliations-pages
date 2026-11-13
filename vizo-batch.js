@@ -1041,6 +1041,30 @@ function vbBlock(result, item) {
   if (source.toPost) roleRows.toPost = source.toPost;
   // The title and header rows keep last month's merged cells (the centered VIZO / Wisdom headings).
   const styled = styledBlock({ grid, roles, cellRoles }, layout.format, roleRows, layout.columns, [["title", titleRow], ["head", headRow]]);
+  // The separator column(s) between the two sides keep last month's fill on every row, blank rows and check formulas
+  // included, so the strip runs unbroken down the block.
+  const [leftEnd, rightStart] = layout.atm ? [Wc.amount, V.date] : [V.amount, Wc.date];
+  const separators = layout.columns.filter(column => columnNumber(column) > columnNumber(leftEnd) && columnNumber(column) < columnNumber(rightStart));
+  const common = (column, sourceRows) => {
+    const counts = new Map();
+    for (const row of sourceRows) {
+      const index = layout.format.styles.get(column + row);
+      if (index !== undefined) counts.set(index, (counts.get(index) ?? 0) + 1);
+    }
+    return [...counts].sort((a, b) => b[1] - a[1])[0]?.[0];
+  };
+  for (const column of separators) {
+    const body = common(column, [...source.vizo, ...source.wisdom, ...source.entry]);
+    for (let k = titleRow; k <= end; k++) {
+      const index = k === titleRow ? layout.format.styles.get(column + source.title) ?? body
+        : k === headRow ? layout.format.styles.get(column + source.head) ?? body : body;
+      if (index === undefined) continue;
+      const cells = styled.styled.get(k) ?? new Map();
+      const xml = cells.get(column);
+      cells.set(column, xml ? xml.replace(/\ss="[^"]*"/, ' s="x' + index + '"') : '<c r="' + column + k + '" s="x' + index + '"/>');
+      styled.styled.set(k, cells);
+    }
+  }
   if (layout.atm) return { sheet: { name: sheetName, template: layout.template, grid: styled.styled, heights: styled.heights, merges: styled.merges, end, columns: layout.columns }, marks };
   return { append: { sheet: book.sheet, grid: styled.styled, merges: styled.merges, heights: styled.heights, end, after: layout.after }, marks };
 }
