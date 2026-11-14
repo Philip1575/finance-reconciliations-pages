@@ -1,6 +1,7 @@
 "use strict";
 
-function vizoNativeProvider(cells) {
+// A VIZO Transaction Summary for one account. With accountName, a pull of several accounts is narrowed to that account.
+function vizoNativeProvider(cells, accountName) {
   const headings = ["Account Number", "Account Name", "Transaction Date", "Effective Date", "Transaction Description", "Check Number", "Amount", "Balance"];
   const header = [1, 2].find(row => headings.every((heading, i) => cells.get(csvColumn(i + 1) + row) === heading));
   if (!header) return undefined;
@@ -9,6 +10,7 @@ function vizoNativeProvider(cells) {
   for (const [address, value] of cells) {
     const row = Number(/^A([1-9]\d*)$/.exec(address)?.[1]);
     if (!(row > header)) continue;
+    if (accountName && !accountName.test(String(cells.get("B" + row) ?? "").trim())) continue;
     accounts.add(value);
     names.add(cells.get("B" + row));
     const date = sourceDate(cells.get("C" + row));
@@ -28,7 +30,7 @@ function vizoNativeProvider(cells) {
 async function readVizoBoundary(file, primary, end, through) {
   requireReport(primary?.account, "Use the original VIZO Transaction Summary with the separate cutoff CSV.");
   requireReport(/\.csv$/i.test(file.name) && file.size <= 20 * 1024 * 1024, "Choose a VIZO Settlement CSV under 20 MB.");
-  const report = vizoNativeProvider(readCsvCells(await file.text()));
+  const report = vizoNativeProvider(readCsvCells(await file.text()), /^(?:vizo )?settlement(?: account)?$/i);
   requireReport(report && report.account === primary.account && /^(?:vizo )?settlement(?: account)?$/i.test(report.name.trim()),
     "Use a VIZO Transaction Summary for the same Settlement account.");
   const last = primary.rows.at(-1);

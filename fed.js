@@ -96,7 +96,7 @@ async function selectDailyBatch(files) {
   if (date && vizo.length === 2) {
     const periods = await Promise.all(vizo.map(async ({ file }) => {
       try {
-        const report = vizoNativeProvider(readCsvCells(await file.text()));
+        const report = vizoNativeProvider(readCsvCells(await file.text()), /^(?:vizo )?settlement(?: account)?$/i);
         return [report.rows[0].date, report.rows.at(-1).date];
       } catch {
         return [];
@@ -721,7 +721,7 @@ async function reconcileVizo(date, template, sign, reviewedDeposits) {
     cutoffFile ? (async () => {
       requireReport(/\.csv$/i.test(primaryFile.name) && primaryFile.size <= 20 * 1024 * 1024,
         "Use the original VIZO Settlement CSV with a separate cutoff file.");
-      const primary = vizoNativeProvider(readCsvCells(await primaryFile.text()));
+      const primary = vizoNativeProvider(readCsvCells(await primaryFile.text()), /^(?:vizo )?settlement(?: account)?$/i);
       return readVizoBoundary(cutoffFile, primary, date, lookahead.at(-1));
     })() : [],
   ]);
@@ -736,6 +736,15 @@ async function reconcileVizo(date, template, sign, reviewedDeposits) {
     new Set(wisdom.filter(item => item.date <= date).map(item => item.date)));
   const allocated = new Set(allocations.map(entry => entry.item));
   const depositCandidates = fedDepositCandidates(unclassified.filter(item => !allocated.has(item)), wisdom);
+  // A forward collection deposit that matches exactly one Wisdom split (branch checks, RDC, or both on one day) is
+  // allocated that way without a typed review; anything ambiguous still waits for the preparer.
+  for (const item of unclassified.filter(item => !allocated.has(item))) {
+    const options = depositCandidates.filter(candidate => candidate.item === item);
+    if (options.length !== 1) continue;
+    const [{ ledgerDate, branchAmount, mobileAmount }] = options;
+    allocations.push({ item, ledgerDate, branchAmount, mobileAmount, automatic: true });
+    allocated.add(item);
+  }
   const groups = new Map();
   for (const item of [...vizo, ...wisdom]) {
     const key = item.source + item.date, rows = groups.get(key) ?? [];

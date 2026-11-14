@@ -238,6 +238,16 @@ function fedCoverItems(result) {
   for (const row of result.comparisons ?? []) {
     if (row.difference) items.push({ label: row.category + " is off " + month + "/" + day, amount: row.difference, section: /^ach is off/i, review: true });
   }
+  // LendKey and Student Choice: the day's debits are appended to the "debits" line as -amount and credits to the
+  // "credits" line as +amount, until the month-end LendKey and Student Choice recs clear them.
+  const lines = { LendKey: /^(lk|lend\s*key)\s+/i, "Student Choice": /^(sc|student choice)\s+/i };
+  for (const [provider, prefix] of Object.entries(lines)) {
+    for (const direction of ["debit", "credit"]) {
+      const amount = (result.finance?.included ?? []).filter(item => item.finance === provider && (item.amount < 0) === (direction === "debit"))
+        .reduce((sum, item) => sum + item.amount, 0);
+      if (amount) items.push({ label: provider + " " + direction + "s", amount, match: new RegExp(prefix.source + direction + "s?\\s*$", "i"), review: false });
+    }
+  }
   for (const row of (result.activity ?? []).filter(item => item.source === "statement" && item.category === "Other · review" && item.amount)) {
     const words = row.description.toUpperCase().match(/[A-Z]{3,}/g) ?? [];
     items.push({ label: row.description.trim() + " " + month + "/" + day, amount: row.amount, words, review: false });
@@ -262,7 +272,10 @@ async function fedApplyCoverItems(blob, name, items) {
   const fmt = amount => (amount / 100).toFixed(2);
   for (const item of items) {
     let row;
-    if (item.words?.length) {
+    if (item.match) {
+      row = lines.find(r => item.match.test(text(r)));
+      requireReport(row, "The Cover has no " + item.label + " line.");
+    } else if (item.words?.length) {
       row = lines.find(r => { const label = text(r).toUpperCase(); return label && item.words.filter(word => label.includes(word)).length >= Math.min(2, item.words.length); });
     }
     if (row) {
