@@ -694,3 +694,55 @@ async function buildKeyInfo(result, wisdom, detailTarget) {
   ], audit);
 }
 
+// Gives cells a solid fill (keeping their other formatting): yellow for entries to make, red for inputs and review.
+async function excelFillCells(blob, name, marks) {
+  const workbook = await openExcel(new File([blob], name), true);
+  const serializer = new XMLSerializer();
+  const styles = await readXml(workbook.zip, "xl/styles.xml");
+  const list = tag => styles.getElementsByTagNameNS(spreadsheetNs, tag)[0];
+  const fills = list("fills"), xfs = list("cellXfs");
+  const fillIds = new Map(), xfIds = new Map();
+  const fillFor = color => {
+    if (!fillIds.has(color)) {
+      const fill = styles.createElementNS(spreadsheetNs, fills.prefix ? fills.prefix + ":fill" : "fill");
+      fill.innerHTML = '<patternFill xmlns="' + spreadsheetNs + '" patternType="solid"><fgColor rgb="' + color + '"/><bgColor indexed="64"/></patternFill>';
+      fills.append(fill);
+      fills.setAttribute("count", String(fills.children.length));
+      fillIds.set(color, fills.children.length - 1);
+    }
+    return fillIds.get(color);
+  };
+  const sheets = new Map();
+  for (const markItem of marks) sheets.set(markItem.sheet, [...(sheets.get(markItem.sheet) ?? []), markItem]);
+  for (const [sheet, items] of sheets) {
+    const target = excelWorksheetPath(workbook, sheet);
+    const doc = await readXml(workbook.zip, target);
+    const rowNodes = new Map(Array.from(doc.getElementsByTagNameNS(spreadsheetNs, "row"), row => [row.getAttribute("r"), row]));
+    const cells = new Map(Array.from(doc.getElementsByTagNameNS(spreadsheetNs, "c"), cell => [cell.getAttribute("r"), cell]));
+    for (const { address, color } of items) {
+      let cell = cells.get(address);
+      if (!cell) {
+        const [, column, rowNumber] = /^([A-Z]+)(\d+)$/.exec(address);
+        const parent = rowNodes.get(rowNumber);
+        if (!parent) continue;
+        cell = doc.createElementNS(spreadsheetNs, parent.prefix ? parent.prefix + ":c" : "c");
+        cell.setAttribute("r", address);
+        parent.insertBefore(cell, Array.from(parent.children).find(child => columnNumber((child.getAttribute("r") ?? "").replace(/\d+$/, "")) > columnNumber(column)) ?? null);
+        cells.set(address, cell);
+      }
+      const key = (cell.getAttribute("s") ?? "0") + "|" + color;
+      if (!xfIds.has(key)) {
+        const xf = Array.from(xfs.children)[Number(cell.getAttribute("s") ?? 0)].cloneNode(true);
+        xf.setAttribute("fillId", String(fillFor(color)));
+        xf.setAttribute("applyFill", "1");
+        xfs.append(xf);
+        xfs.setAttribute("count", String(xfs.children.length));
+        xfIds.set(key, xfs.children.length - 1);
+      }
+      cell.setAttribute("s", String(xfIds.get(key)));
+    }
+    workbook.zip.file(target, serializer.serializeToString(doc));
+  }
+  workbook.zip.file("xl/styles.xml", serializer.serializeToString(styles));
+  return workbook.zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+}

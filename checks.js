@@ -1,605 +1,343 @@
 "use strict";
 
-const checkField = id => document.getElementById(id);
-let draftFile, priorFile, draftBook, checkResult;
-const checkCoverFiles = {};
-let checkRevision = 0, draftRevision = 0;
-const draftCheckHeaders = {
-  date: ["date", "effective date", "transaction date"],
-  code: ["txn", "txn code", "tran code", "transaction code"],
-  reference: ["reference", "reference number", "check number", "check reference", "draft number"],
-  amount: ["amount", "signed amount", "transaction amount"],
-};
+// Cashier's checks: last month's reconciliation plus the 903 draft history become this month's reconciliation. The
+// month's 903 activity is matched (checks and journal entries written against the drafts and journals that cleared
+// them), cleared items come off the outstanding list, new ones go on, and the cover gets the month and the 903 balance.
 
-function invalidateChecks() {
-  checkRevision++;
-  checkResult = undefined;
-  checkField("results").hidden = true;
-  checkField("status").textContent = "";
+const ckField = id => document.getElementById(id);
+const ckFiles = {};
+let ckResult, ckRevision = 0;
+const ckMoney = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+const ckMonthNames = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+function ckStatus(message, error = false) {
+  ckField("status").textContent = message;
+  ckField("status").classList.toggle("error", error);
 }
 
-function checkStatus(message, error = false) {
-  const status = checkField("status");
-  status.textContent = message;
-  status.classList.toggle("error", error);
+const ckSerial = iso => (Date.parse(iso + "T00:00:00Z") - Date.UTC(1899, 11, 30)) / 86400000;
+const ckText = value => String(value ?? "").replace(/\s+/g, " ").trim();
+function ckDate(value, date1904) {
+  if (value === undefined || value === null || value === "") return undefined;
+  try { return sourceDate(typeof value === "number" ? Math.floor(value) : value, date1904); } catch { return undefined; }
 }
+const ckRows = cells => [...new Set([...cells.keys()].map(address => Number(/\d+$/.exec(address)[0])))].sort((a, b) => a - b);
 
-async function selectDraft(file) {
-  const revision = ++draftRevision;
-  draftFile = file;
-  draftBook = undefined;
-  invalidateChecks();
-  checkField("draft-mapping").hidden = true;
-  checkField("draft-status").textContent = file ? "Opening " + file.name + "…" : "";
-  if (!file) return;
-  try {
-    const workbook = await openExcel(file, true);
-    if (revision !== draftRevision) return;
-    draftBook = workbook;
-    checkField("draft-sheet").replaceChildren(...Array.from(workbook.sheets.keys(), name => new Option(name, name)));
-    try { await suggestDraftCheckColumns(); }
-    catch (error) {
-      if (revision === draftRevision) checkField("draft-status").textContent = error.message;
-    }
-    if (revision !== draftRevision) return;
-    checkField("draft-mapping").hidden = false;
-  } catch (error) {
-    if (revision === draftRevision) checkField("draft-status").textContent = error.message;
+// The Portico draft history: post date, time, transaction code, reversal flag, amount, balance after and draft number.
+async function ckReadHistory(file) {
+  let cells, date1904 = false;
+  if (/\.csv$/i.test(file.name)) cells = readCsvCells(await file.text());
+  else {
+    const book = await openExcel(file, true);
+    date1904 = book.date1904;
+    cells = await readCells(book, [...book.sheets.keys()][0]);
   }
-}
-
-async function suggestDraftCheckColumns() {
-  const workbook = draftBook, revision = checkRevision, sheet = checkField("draft-sheet").value;
-  if (!workbook) return;
-  const status = checkField("draft-status");
-  status.textContent = draftFile.name;
-  const cells = await readCells(workbook, sheet), headers = new Map();
-  if (revision !== checkRevision || draftBook !== workbook || checkField("draft-sheet").value !== sheet) return;
-  for (const [address, value] of cells) {
-    const match = /^([A-Z]+)([1-9]\d*)$/.exec(address);
-    if (!match || Number(match[2]) > 50 || typeof value !== "string") continue;
-    const label = value.trim().toLowerCase().replace(/\s+/g, " ");
-    const field = Object.keys(draftCheckHeaders).find(key => draftCheckHeaders[key].includes(label));
-    if (!field) continue;
-    const row = Number(match[2]), columns = headers.get(row) ?? {};
-    columns[field] = Object.hasOwn(columns, field) ? "" : match[1];
-    headers.set(row, columns);
-  }
-  const matches = [...headers].filter(([, columns]) => Object.keys(draftCheckHeaders).every(key => columns[key]));
-  if (matches.length !== 1) return;
-  const [[row, columns]] = matches;
-  for (const [field, column] of Object.entries(columns)) checkField(field + "-column").value = column;
-  checkField("first-row").value = row + 1;
-  status.textContent = draftFile.name + " · Draft history columns detected. Verify the worksheet and row range.";
-}
-
-function selectPriorChecks(file) {
-  priorFile = file;
-  checkField("prior-status").textContent = file?.name ?? "";
-  if (file) checkField("empty-prior").checked = false;
-  invalidateChecks();
-}
-
-function selectCheckCover(kind, file) {
-  checkCoverFiles[kind] = file;
-  checkField(kind + "-status").textContent = file?.name ?? "";
-  if (kind === "closing") {
-    checkField("closing-mapping").hidden = !file;
-    checkField("balance").disabled = Boolean(file);
-  } else {
-    checkField("adjustments").disabled = Boolean(file);
-  }
-  invalidateChecks();
-}
-
-async function readCheckClosing(month, file) {
-  if (!file) {
-    const manual = checkField("balance").value.trim();
-    if (manual) return { value: cents(manual), source: "Entered manually" };
-    const sheet = checkField("draft-sheet").value;
-    const cells = await readCells(draftBook, sheet);
-    const header = column => String(cells.get(column + "1") ?? "").trim().replace(/\s+/g, " ").toLowerCase();
-    requireReport(/^Acct_Num_\d+$/i.test(sheet) && ["effective date", "txn", "transaction amount", "after balance", "draft number"]
-      .every((name, i) => header("EHKLM"[i]) === name),
-    "Enter the closing balance or upload a CUSA closing-balance workbook.");
-    const rows = [...cells].flatMap(([address, value]) => {
-      const row = Number(/^E([1-9]\d*)$/.exec(address)?.[1]);
-      return row > 1 && String(value ?? "").trim() ? [{
-        row, date: sourceDate(value, draftBook.date1904), code: String(cells.get("H" + row) ?? "").trim().toUpperCase(),
-        amount: cents(cells.get("K" + row)), balance: cents(cells.get("L" + row)),
-      }] : [];
-    }).sort((a, b) => a.row - b.row);
-    const closing = rows.find(item => item.date.startsWith(month));
-    requireReport(closing && rows.every((item, i) => i === 0
-      || (rows[i - 1].date >= item.date && item.balance + rows[i - 1].amount === rows[i - 1].balance)),
-    "Check the dates and running balances in the CUSA history, or supply a verified month-end balance.");
-    return { value: closing.balance, source: draftFile.name + " · " + sheet + "!L" + closing.row, accountHistory: rows };
-  }
-  const book = await openExcel(file, true);
-  const sheet = checkField("closing-sheet").value.trim() || (book.sheets.size === 1 ? [...book.sheets.keys()][0] : "");
-  const cell = checkField("closing-cell").value.trim().toUpperCase();
-  const dateColumn = checkField("closing-date").value.trim().toUpperCase();
-  const location = /^([A-Z]{1,3})([1-9]\d{0,6})$/.exec(cell);
-  requireReport(book.sheets.has(sheet) && location && columnNumber(location[1]) <= 16384 && Number(location[2]) <= 1048576,
-    "Choose the closing-balance worksheet and its verified ending cell.");
-  requireReport(!dateColumn || (/^[A-Z]{1,3}$/.test(dateColumn) && columnNumber(dateColumn) <= 16384 && dateColumn !== location[1]),
-    "Use a date column different from the balance column.");
-  const cells = await readCells(book, sheet);
-  if (dateColumn) {
-    const date = sourceDate(cells.get(dateColumn + location[2]), book.date1904);
-    requireReport(date.slice(0, 7) === month, "The ending balance date is outside the selected month.");
-  }
-  return { value: cents(cells.get(cell)), source: file.name + " · " + sheet + "!" + cell };
-}
-
-function checkMonthLabel(month) {
-  return new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric", timeZone: "UTC" })
-    .format(new Date(month + "-01T00:00:00Z"));
-}
-
-async function readCheckCover(month, file) {
-  if (!file) return { adjustments: cents(checkField("adjustments").value), items: [] };
-  const book = await openExcel(file, true), formulas = new Map();
-  const cells = await readCells(book, "Reconciliation", formulas);
-  const period = checkMonthLabel(month);
-  requireReport(String(cells.get("A2") ?? "").trim().toLowerCase() === "for " + period.toLowerCase(),
-    "Set Reconciliation!A2 to the selected month in the prepared workbook.");
-  const text = address => String(cells.get(address) ?? "").trim().toLowerCase();
-  const formula = address => String(formulas.get(address) ?? "").replace(/[\s$]/g, "").toUpperCase();
-  requireReport(text("A1") === "cashier's check reconciliation" && /^balance per .+ account$/.test(text("A5"))
-    && text("A17") === "reconciled balance" && !formulas.has("E5")
-    && ["SUM(E13:E16,E5)", "SUM(E5,E13:E16)", "E5+SUM(E13:E16)"].includes(formula("E17"))
-    && formula("E18") === "E9-E17", "The prepared Reconciliation sheet differs from the supported cover.");
+  const rows = ckRows(cells);
+  const header = rows.find(row => row <= 10 && [...cells].some(([address, value]) => Number(/\d+$/.exec(address)[0]) === row && /^post date$/i.test(ckText(value))));
+  requireReport(header, "The draft history needs a Post Date heading.");
+  const columns = new Map([...cells].filter(([address]) => Number(/\d+$/.exec(address)[0]) === header)
+    .map(([address, value]) => [ckText(value).toLowerCase(), address.replace(/\d+$/, "")]));
+  const column = (...names) => names.map(name => columns.get(name)).find(Boolean);
+  const at = { date: column("post date"), time: column("time"), code: column("txn"), reversal: column("r"), journal: column("can"),
+    amount: column("transaction amount", "amount"), balance: column("after balance", "balance"), draft: column("draft number"),
+    description: column("history code description"), statement: column("statement description") };
+  for (const name of ["date", "code", "amount", "balance"]) requireReport(at[name], "The draft history needs a " + name + " column.");
   const items = [];
-  for (let row = 13; row <= 16; row++) {
-    const address = "E" + row, raw = cells.get(address);
-    if (raw === undefined && !formulas.has(address)) continue;
-    requireReport(raw !== undefined, "Recalculate and save the line item at Reconciliation!" + address + ".");
-    items.push([address, String(cells.get("A" + row) ?? ""), cents(raw)]);
+  for (const row of rows.filter(row => row > header)) {
+    const date = ckDate(cells.get(at.date + row), date1904);
+    if (!date) continue;
+    items.push({ row, date, time: ckText(cells.get(at.time + row)), code: ckText(cells.get(at.code + row)).toUpperCase(),
+      reversal: /^y/i.test(ckText(cells.get(at.reversal + row))), journal: Number(cells.get(at.journal + row)) || 0,
+      amount: cents(cells.get(at.amount + row)), balance: cents(cells.get(at.balance + row)), draft: cells.get(at.draft + row) ?? "",
+      description: [ckText(cells.get(at.description + row)), ckText(cells.get(at.statement + row))].filter(Boolean).join(" · ") });
   }
-  const outstanding = book.sheets.has("Checks Outstanding") ? await readCheckOutstandingSheet(book) : undefined;
-  const destination = outstanding?.range;
-  const linked = destination && formula("E9").replace(/^\+/, "") === "'CHECKSOUTSTANDING'!D" + destination.totalRow
-    && ["Date Written", "Account Number", "Check Amount", "Check Number", "Reason"]
-      .every((title, i) => String(outstanding.cells.get("BCDEF"[i] + "3") ?? "").trim().toLowerCase() === title.toLowerCase());
-  const auditTarget = completionTarget("Reconciliation", cells, formulas, "A26", "A29", "E26", "E27");
-  return { adjustments: items.reduce((sum, [, , amount]) => sum + amount, 0), items, file: file.name, template: file,
-    destination, outstanding: linked ? outstanding : undefined, auditTarget };
+  requireReport(items.length, "The draft history has no dated rows.");
+  // Oldest first: date, then time, then the journal (CAN) number.
+  items.sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time) || a.journal - b.journal);
+  return { file: file.name, items };
 }
 
-async function readDraftChecks(workbook, sheet, columns, first, last, month) {
-  const cells = await readCells(workbook, sheet);
-  const rows = new Set();
-  for (const [address, value] of cells) {
-    const match = /^([A-Z]+)([1-9]\d*)$/.exec(address);
-    if (match && columns.includes(match[1]) && String(value ?? "").trim()) {
-      const row = Number(match[2]);
-      if (row >= first && row <= last) rows.add(row);
+// Last month's workbook: the latest CC Worksheet block (outstanding items on the left, the month's written and cleared
+// items on the right), the Checks Outstanding list and the cover cells.
+async function ckReadBook(file) {
+  const book = await openExcel(file, true);
+  for (const sheet of ["Reconciliation", "CC Worksheet", "Checks Outstanding"]) requireReport(book.sheets.has(sheet), "The workbook has no " + sheet + " sheet.");
+  const cc = await readCells(book, "CC Worksheet");
+  const rows = ckRows(cc);
+  const titles = rows.filter(row => /^other outstanding$/i.test(ckText(cc.get("A" + row))));
+  requireReport(titles.length, "The CC Worksheet has no OTHER OUTSTANDING block.");
+  const title = titles.at(-1), head = title - 1;
+  const headDate = ckDate(cc.get("A" + head), book.date1904);
+  requireReport(headDate, "The CC Worksheet block above row " + title + " has no month date.");
+  const rightColumn = [...cc].find(([address, value]) => Number(/\d+$/.exec(address)[0]) === title && /^written and cleared$/i.test(ckText(value)))?.[0].replace(/\d+$/, "");
+  requireReport(rightColumn, "The CC Worksheet block needs a WRITTEN AND CLEARED heading.");
+  const right = [0, 1, 2, 3].map(k => csvColumn(columnNumber(rightColumn) + k));
+  const body = rows.filter(row => row > title);
+  const left = body.filter(row => typeof cc.get("D" + row) === "number").map(row => ({
+    row, cells: ["A", "B", "C", "D"].map(column => cc.get(column + row)), date: ckDate(cc.get("A" + row), book.date1904),
+    ref: cc.get("B" + row) ?? "", code: ckText(cc.get("C" + row)).toUpperCase(), amount: cents(cc.get("D" + row)), carried: true }));
+  const previous = rows.filter(row => row < head);
+  const gap = Math.max(0, head - (previous.at(-1) ?? head - 1) - 1);
+  const outstandingCells = await readCells(book, "Checks Outstanding");
+  const outRows = ckRows(outstandingCells);
+  const totalRow = outRows.find(row => /^total checks outstanding$/i.test(ckText(outstandingCells.get("B" + row))));
+  requireReport(totalRow, "The Checks Outstanding sheet needs its Total Checks Outstanding row.");
+  const outstanding = [], years = [];
+  for (const row of outRows.filter(row => row > 3 && row < totalRow)) {
+    const b = outstandingCells.get("B" + row), d = outstandingCells.get("D" + row);
+    if (typeof d === "number") outstanding.push({ row, date: ckDate(b, book.date1904), amount: cents(d), code: ckText(outstandingCells.get("E" + row)) });
+    else if (typeof b === "number" && Number.isInteger(b) && b >= 1990 && b <= 2200) years.push({ row, year: b });
+    else if (typeof b === "number" || /^\d{4}$/.test(ckText(b))) {
+      const date = ckDate(b, book.date1904);
+      years.push({ row, year: /^\d{4}$/.test(ckText(b)) ? Number(ckText(b)) : Number(date?.slice(0, 4)) });
     }
   }
-  return Array.from(rows).sort((a, b) => a - b).flatMap(row => {
-    const [dateCell, codeCell, referenceCell, amountCell] = columns.map(column => cells.get(column + row));
-    try {
-      const date = sourceDate(dateCell, workbook.date1904);
-      if (date.slice(0, 7) !== month) return [];
-      const code = String(codeCell ?? "").trim().toUpperCase();
-      const reference = String(referenceCell ?? "").trim();
-      const amount = cents(amountCell);
-      return [{ date, code, reference, amount, row, source: "Draft history",
-        kind: code === "SU" && amount > 0 ? "issued" : code === "DF" && amount < 0 ? "clearing" : "review" }];
-    } catch (error) {
-      throw new Error(sheet + " row " + row + ": " + error.message);
-    }
-  });
+  const cover = await readCells(book, "Reconciliation");
+  const coverRow = label => ckRows(cover).find(row => label.test(ckText(cover.get("A" + row))));
+  return { file, book, head, title, headDate, right, left, gap, outstanding, years, totalRow, outCells: outstandingCells,
+    coverTitle: ckText(cover.get("A2")), balanceRow: coverRow(/^balance per 903 account$/i), completedRow: coverRow(/^reconciliation completed by:?$/i),
+    format: (await readWorkbookFormatting(book, ["CC Worksheet"]))?.sheets["CC Worksheet"], bodyRows: body, lastRow: rows.at(-1),
+    rightRows: body.filter(row => typeof cc.get(right[3] + row) === "number"), leftRows: left.map(item => item.row) };
 }
 
-function draftReviewRows(draft, text, label) {
-  const updates = new Map();
-  const byRow = new Map(draft.map(item => [item.row, item]));
-  for (const [index, line] of text.trim().split(/\r?\n/).entries()) {
-    if (!line.trim()) continue;
-    const [rowText, value, ...extra] = line.split("\t").map(value => value.trim());
-    if (index === 0 && /^(?:source|worksheet) row$/i.test(rowText)) continue;
-    const row = Number(rowText);
-    requireReport(/^[1-9]\d*$/.test(rowText) && Number.isSafeInteger(row) && value && !extra.length,
-      label + " row " + (index + 1) + " needs a draft worksheet row number and a reviewed value.");
-    requireReport(!updates.has(row), "More than one " + label.toLowerCase() + " was entered for draft row " + row + ".");
-    requireReport(byRow.has(row), label + " row " + row + " is outside the selected draft history range or month.");
-    updates.set(row, { item: byRow.get(row), value });
-  }
-  return updates.values();
-}
-
-async function readCheckOutstandingSheet(workbook) {
-  const formulas = new Map();
-  const cells = await readCells(workbook, "Checks Outstanding", formulas);
-  const ranges = [...formulas].flatMap(([address, expression]) => {
-    const row = Number(/^D([1-9]\d*)$/.exec(address)?.[1]);
-    if (!row || !/^total\b/i.test(String(cells.get("B" + row) ?? "").trim()) || String(cells.get("E" + row) ?? "").trim()) return [];
-    const match = /^SUM\(D([1-9]\d*):D([1-9]\d*)\)$/i.exec(String(expression).replace(/[\s$]/g, ""));
-    if (!match) return [];
-    const [first, last] = match.slice(1).map(Number);
-    requireReport(first >= 4 && first <= last && last < row, "The Checks Outstanding total has an invalid range.");
-    const saved = cells.get(address);
-    return [{ first, last, totalRow: row, savedTotal: typeof saved === "number" ? cents(saved) : undefined }];
-  });
-  requireReport(ranges.length <= 1, "The Checks Outstanding worksheet has several possible total ranges.");
-  return { cells, formulas, range: ranges[0] };
-}
-
-async function readPriorChecks(file, month) {
-  if (!file) return { entries: [], outside: [] };
-  const workbook = await openExcel(file, true);
-  if (workbook.sheets.has("Reconciliation")) {
-    const cover = await readCells(workbook, "Reconciliation");
-    if (/^cashier's check reconciliation(?: · proposed)?$/i.test(String(cover.get("A1") ?? "").trim())) {
-      const priorMonth = dateOffset(month + "-01", -1).slice(0, 7);
-      const period = String(cover.get("A2") ?? "").trim().toLowerCase();
-      requireReport([priorMonth, checkMonthLabel(priorMonth).toLowerCase()].some(value => period === "for " + value),
-        "The opening list must come from the " + checkMonthLabel(priorMonth) + " reconciliation. Check the period on its cover.");
-    }
-  }
-  const { cells, formulas, range } = await readCheckOutstandingSheet(workbook);
-  const entries = [], outside = [];
-  for (const [address, value] of cells) {
-    const match = /^D([1-9]\d*)$/.exec(address);
-    if (!match || Number(match[1]) < 4) continue;
-    const row = Number(match[1]);
-    const values = ["B", "C", "E", "F"].map(column => cells.get(column + row));
-    if (formulas.has(address) && values.slice(1).every(value => !String(value ?? "").trim())
-      && (!String(values[0] ?? "").trim() || /^total\b/i.test(String(values[0]).trim()))) continue;
-    const [rawDate, account, reference, reason] = values;
-    const amount = cents(value);
-    if (amount === 0) continue;
-    let date;
-    try { date = sourceDate(rawDate, workbook.date1904); } catch { date = ""; }
-    const item = {
-      date, written: date || String(rawDate ?? ""), account: String(account ?? ""), reason: String(reason ?? ""),
-      reference: String(reference ?? "").trim(), amount, row, source: "Prior outstanding", kind: "prior", code: "",
+// The month's 903 activity in order: amounts in (checks and journal entries written) open an item; amounts out (drafts
+// and journals) clear the open item of the same amount, the month's own items first, then the oldest carried item; two
+// same-day items can clear together. Anything out with nothing to clear is flagged.
+function ckReconcile(book, history, month) {
+  const [year, number] = month.split("-").map(Number);
+  const first = month + "-01", last = new Date(Date.UTC(year, number, 0)).toISOString().slice(0, 10);
+  requireReport(book.headDate < first, "Last month's workbook already has a block for " + month + " or later. Use last month's reconciliation.");
+  const monthRows = history.items.filter(item => item.date >= first && item.date <= last);
+  const before = history.items.filter(item => item.date < first);
+  const open = book.left.map(item => ({ ...item }));
+  const pairs = [], issues = [], takenRows = new Set();
+  for (const item of monthRows) {
+    if (item.amount > 0) { open.push({ date: item.date, ref: "", code: item.code, amount: item.amount, carried: false, history: item }); continue; }
+    if (!item.amount) continue;
+    const want = -item.amount;
+    const pick = () => {
+      const exact = open.filter(entry => entry.amount === want);
+      return exact.find(entry => !entry.carried) ?? exact[0];
     };
-    if (range && (row < range.first || row > range.last)) {
-      if (item.reference || item.date) outside.push(item);
-    } else entries.push(item);
+    let written = pick();
+    if (written) {
+      open.splice(open.indexOf(written), 1);
+      pairs.push({ written: [written], cleared: item });
+      continue;
+    }
+    let pair;
+    for (let a = 0; a < open.length && !pair; a++) for (let b = a + 1; b < open.length && !pair; b++) {
+      if (open[a].date === open[b].date && open[a].amount + open[b].amount === want) pair = [open[a], open[b]];
+    }
+    if (pair) {
+      for (const entry of pair) open.splice(open.indexOf(entry), 1);
+      pairs.push({ written: pair, cleared: item, note: "Two items written the same day cleared together" });
+      continue;
+    }
+    // An older check on the Checks Outstanding list (not in the worksheet's recent list): the draft number first, then the
+    // oldest check of that amount.
+    const listed = book.outstanding.filter(row => !takenRows.has(row.row) && row.amount === want);
+    const byNumber = listed.find(row => item.draft && String(row.code) === String(item.draft));
+    const old = byNumber ?? listed[0];
+    if (old) {
+      takenRows.add(old.row);
+      pairs.push({ written: [{ date: old.date, code: String(old.code || "CK"), amount: old.amount, carried: true, outRow: old.row }], cleared: item,
+        note: "Clears a check from the Checks Outstanding list" });
+      continue;
+    }
+    pairs.push({ written: [], cleared: item, review: true });
+    issues.push({ date: item.date, amount: item.amount, text: item.code + " " + (item.draft ? "draft " + item.draft + " " : "") + ckMoney.format(item.amount / 100)
+      + " has no outstanding check or journal entry of that amount" });
   }
-  return { entries, outside, range };
+  const balanceRow = monthRows.at(-1) ?? before.at(-1);
+  requireReport(balanceRow, "The draft history has no balance at the end of " + month + ".");
+  const balance = balanceRow.balance;
+  const total = open.reduce((sum, entry) => sum + entry.amount, 0);
+  // Checks Outstanding rows to clear and to add.
+  const used = new Set();
+  const clearRows = [];
+  for (const entry of pairs.flatMap(pair => pair.written).filter(entry => entry.carried)) {
+    if (entry.outRow) { used.add(entry.outRow); clearRows.push(entry.outRow); continue; }
+    const row = book.outstanding.find(item => !used.has(item.row) && item.amount === entry.amount && (!entry.date || !item.date || item.date === entry.date))
+      ?? book.outstanding.find(item => !used.has(item.row) && item.amount === entry.amount);
+    if (row) { used.add(row.row); clearRows.push(row.row); }
+    else issues.push({ date: entry.date, amount: entry.amount, text: "Cleared item " + ckMoney.format(entry.amount / 100) + " was not found on Checks Outstanding; remove it there by hand" });
+  }
+  const added = open.filter(entry => !entry.carried);
+  const listTotal = book.outstanding.filter(item => !clearRows.includes(item.row)).reduce((sum, item) => sum + item.amount, 0)
+    + added.reduce((sum, entry) => sum + entry.amount, 0);
+  const listCount = book.outstanding.length - clearRows.length + added.length;
+  if (listTotal !== balance) issues.push({ date: last, amount: balance - listTotal, text: "The Checks Outstanding list will not add up to the 903 balance" });
+  return { month, first, last, monthRows, pairs, open, added, clearRows, balance, total, listTotal, listCount, issues };
 }
 
-function reconcileChecks(prior, draft) {
-  const groups = new Map();
-  const outstanding = new Set(prior);
-  const matches = [];
-  const exceptions = [];
-  for (const item of [...prior, ...draft]) {
-    if (item.disposition === "exclude") continue;
-    if (item.disposition === "carry") outstanding.add(item);
-    if (!item.reference) {
-      if (item.disposition !== "carry") exceptions.push([item, "Missing check reference"]);
-      continue;
+function ckShow(result) {
+  const table = (rows, headers) => {
+    const element = document.createElement("table");
+    if (headers) element.createTHead().insertRow().append(...headers.map(text => Object.assign(document.createElement("th"), { textContent: text })));
+    const body = element.createTBody();
+    for (const values of rows) {
+      const row = body.insertRow();
+      values.forEach((value, i) => {
+        const cell = i === 0 && !headers ? Object.assign(document.createElement("th"), { scope: "row" }) : row.insertCell();
+        cell.textContent = value;
+        if (i === 0 && !headers) row.append(cell);
+      });
     }
-    if (!groups.has(item.reference)) groups.set(item.reference, []);
-    groups.get(item.reference).push(item);
-  }
-  for (const group of groups.values()) {
-    if (group.some(item => item.disposition === "carry")) {
-      for (const item of group) {
-        if (item.disposition !== "carry") exceptions.push([item, "Reference also has a reviewed carryover"]);
-      }
-      continue;
-    }
-    const opening = group.filter(item => item.kind === "prior");
-    const issued = group.filter(item => item.kind === "issued");
-    const cleared = group.filter(item => item.kind === "clearing");
-    const written = [...opening, ...issued];
-    const repeated = new Set(group.map(item => JSON.stringify([item.source, item.date, item.code, item.amount]))).size !== group.length;
-    const mixedIssue = new Set(opening.map(item => JSON.stringify([item.date, item.account]))).size > 1 || (opening.length && issued.length)
-      || new Set(issued.map(item => item.date)).size > 1;
-    const unresolved = group.some(item => item.kind === "review" || !item.date
-      || (item.kind === "prior" && item.amount < 0)) || repeated || mixedIssue;
-    if (!unresolved && written.length && !cleared.length) {
-      issued.forEach(item => outstanding.add(item));
-      continue;
-    }
-    const total = group.reduce((sum, item) => sum + item.amount, 0);
-    const chronological = cleared.every(clear => written.every(issue => clear.date >= issue.date));
-    if (!unresolved && written.length && cleared.length && chronological && total === 0) {
-      opening.forEach(item => outstanding.delete(item));
-      matches.push(group);
-      continue;
-    }
-    const reason = unresolved ? "Review duplicate, date, code or signed carryover"
-      : !written.length ? "No matching open check" : !chronological ? "Clearing date precedes issue date" : "Amounts do not balance";
-    for (const item of group) exceptions.push([item, reason]);
-  }
-  return { outstanding: [...outstanding], matches, exceptions };
+    return element;
+  };
+  const written = result.monthRows.filter(item => item.amount > 0).length;
+  ckField("summary").replaceChildren(table([
+    ["903 balance at month end", ckMoney.format(result.balance / 100)],
+    ["Checks Outstanding after this month", result.listCount + " · " + ckMoney.format(result.listTotal / 100)],
+    ["Difference", ckMoney.format((result.balance - result.listTotal) / 100)],
+    ["Written this month", written],
+    ["Cleared this month", result.pairs.filter(pair => pair.written.length).length + " (" + result.pairs.filter(pair => pair.written.some(entry => entry.carried)).length + " from earlier months)"],
+    ["New outstanding", result.added.length],
+    ["Items to review", result.issues.length],
+  ]));
+  ckField("details").replaceChildren(table(
+    [...result.pairs.map(pair => [pair.cleared.date, pair.cleared.code + (pair.cleared.draft ? " " + pair.cleared.draft : ""), ckMoney.format(pair.cleared.amount / 100),
+      pair.written.map(entry => (entry.date ?? "") + " " + entry.code + " " + ckMoney.format(entry.amount / 100)).join(" + ") || "—",
+      pair.review ? "Review" : pair.note ?? (pair.written.some(entry => entry.carried) ? "Clears an earlier month" : "Cleared")]),
+    ...result.added.map(entry => [entry.date, entry.code, ckMoney.format(entry.amount / 100), "—", "New outstanding"]),
+    ...result.issues.map(issue => [issue.date, "", ckMoney.format(issue.amount / 100), "", issue.text])],
+    ["Date", "Item", "Amount", "Written item", "Result"]));
+  ckField("results").hidden = false;
 }
 
-function suggestCheckFunding(draft, accountHistory, month) {
-  const earlier = (accountHistory ?? []).filter(item => item.date < month + "-01");
-  const activity = [...earlier, ...draft.filter(item => item.disposition !== "exclude")];
-  const funding = new Map(), debits = new Map();
-  for (const item of activity) {
-    const index = item.code === "JV" && item.amount > 0 ? funding
-      : ["DF", "JV"].includes(item.code) && item.amount < 0 ? debits : undefined;
-    if (!index) continue;
-    const amount = Math.abs(item.amount), rows = index.get(amount) ?? [];
-    rows.push(item);
-    index.set(amount, rows);
-  }
-  return draft.flatMap(item => {
-    const amount = -item.amount, candidates = funding.get(amount) ?? [];
-    const matching = candidates.filter(candidate => candidate.date <= item.date);
-    if (debits.get(amount)?.length !== 1 || debits.get(amount)[0] !== item || matching.length !== 1) return [];
-    return [{ debit: item, funding: matching[0], type: item.code === "DF" ? "Possible funding for draft clearing" : "Possible journal offset" }];
+// The month's CC Worksheet block, laid out and formatted like last month's: the month date, the OTHER OUTSTANDING /
+// WRITTEN AND CLEARED headings, outstanding items on the left and the written and cleared pairs on the right.
+function ckBlock(book, result) {
+  const grid = new Map(), roles = new Map(), cellRoles = new Map(), marks = [];
+  const put = (r, column, xml) => { const cells = grid.get(r) ?? new Map(); cells.set(column, xml); grid.set(r, cells); };
+  const value = (r, column, raw) => {
+    if (raw === undefined || raw === null || raw === "") return;
+    if (typeof raw === "number") put(r, column, `<c r="${column}${r}" s="0"><v>${raw}</v></c>`);
+    else put(r, column, `<c r="${column}${r}" s="0" t="inlineStr"><is><t xml:space="preserve">${xmlText(String(raw))}</t></is></c>`);
+  };
+  let r = 1 + Math.max(1, book.gap);
+  const head = r;
+  value(r, "A", ckSerial(result.first));
+  roles.set(r++, "head");
+  value(r, "A", "OTHER OUTSTANDING");
+  value(r, book.right[0], "WRITTEN AND CLEARED");
+  roles.set(r++, "title");
+  const start = r;
+  const leftRows = result.open.map(entry => entry.carried ? entry.cells
+    : [ckSerial(entry.date), entry.ref || "", entry.code, entry.amount / 100]);
+  leftRows.forEach((cells, k) => ["A", "B", "C", "D"].forEach((column, i) => value(start + k, column, cells[i])));
+  // Pairs written this month first, then those clearing earlier months, each followed by a blank row.
+  const rightRows = [];
+  const ordered = [...result.pairs].sort((x, y) => Number(x.written.some(entry => entry.carried)) - Number(y.written.some(entry => entry.carried)));
+  ordered.forEach((pair, index) => {
+    if (index) rightRows.push({ cells: [] });
+    for (const entry of pair.written) rightRows.push({ cells: [entry.date ? ckSerial(entry.date) : entry.cells?.[0], "", entry.code, entry.amount / 100] });
+    rightRows.push({ cells: [ckSerial(pair.cleared.date), pair.cleared.draft || "", pair.cleared.code, pair.cleared.amount / 100], review: pair.review });
   });
+  rightRows.forEach((entry, k) => {
+    entry.cells.forEach((raw, i) => value(start + k, book.right[i], raw));
+    if (entry.cells.length) for (const column of book.right) cellRoles.set(column + (start + k), "right");
+    if (entry.review) for (const column of book.right) marks.push({ row: start + k, column });
+  });
+  const end = start + Math.max(leftRows.length, rightRows.length, 1) - 1;
+  for (let k = start; k <= end; k++) roles.set(k, "body");
+  const columns = Array.from({ length: columnNumber(book.right[3]) }, (_, k) => csvColumn(k + 1));
+  // Outstanding items take last month's left-side format and written/cleared items its right-side format.
+  for (let k = 0; k < leftRows.length; k++) for (const column of ["A", "B", "C", "D"]) cellRoles.set(column + (start + k), "left");
+  const roleRows = { head: book.head, title: book.title, body: book.bodyRows };
+  if (book.leftRows.length) roleRows.left = book.leftRows;
+  if (book.rightRows.length) roleRows.right = book.rightRows;
+  const styled = styledBlock({ grid, roles, cellRoles }, book.format, roleRows, columns, []);
+  return { append: { sheet: "CC Worksheet", grid: styled.styled, merges: styled.merges, heights: styled.heights, end, after: book.lastRow }, marks, head };
 }
 
-function displayChecks(result) {
-  const table = document.createElement("table");
-  const currency = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
-  const values = [
-    ["Opening checks in the prior total", result.priorCount],
-    ["Outstanding paste begins at", "B" + result.pasteRange.first],
-    ["Matched check references", result.matches.length],
-    ["Rows needing review", result.exceptions.length],
-    ["Proposed outstanding", currency.format(result.total / 100)],
-    ["Closing balance plus reviewed line items", currency.format(result.adjusted / 100)],
-    ["Proposed difference", currency.format(result.difference / 100)],
-  ];
-  const corrected = result.history.filter(item => item.originalReference !== undefined).length;
-  if (result.fundingReview.length) values.push(["Journal funding or offset candidates", result.fundingReview.length]);
-  if (corrected) values.push(["Reviewed reference corrections applied", corrected]);
-  const carry = result.history.filter(item => item.disposition === "carry").length;
-  if (carry) values.push(["Reviewed issues carried forward", carry]);
-  const excluded = result.history.filter(item => item.disposition === "exclude").length;
-  if (excluded) values.push(["Draft rows excluded by review", excluded]);
-  const unresolvedIssued = result.exceptions.filter(([item]) => item.kind === "issued").length;
-  if (unresolvedIssued) values.push(["New issues awaiting review before carryover", unresolvedIssued]);
-  if (result.pasteRange.overflow) values.push(["Destination total", "Extend the total to cover every new row"]);
-  const body = table.createTBody();
-  for (const [label, value] of values) {
-    const row = body.insertRow();
-    const heading = document.createElement("th");
-    heading.scope = "row";
-    heading.textContent = label;
-    row.append(heading);
-    row.insertCell().textContent = value;
-  }
-  checkField("summary").replaceChildren(table);
-  checkField("download-template").hidden = !result.cover.template;
-  const note = checkField("template-download-note");
-  note.hidden = !result.cover.template;
-  note.textContent = result.cover.outstanding && !result.pasteRange.overflow
-    ? "The filled copy updates the cover and replaces the outstanding list. Use the review Excel for draft history and exceptions."
-    : "The filled copy updates the cover. Use the review Excel to paste outstanding rows and verify the total range.";
-  checkField("results").hidden = false;
-}
-
-async function buildChecks(result) {
+async function ckBuild(book, result) {
   const audit = reconciliationAudit();
-  const { label, number, date, row, worksheet } = excelOutputCells();
-  const formula = (address, expression, value) =>
-    `<c r="${address}" s="2"><f>${xmlText(expression)}</f><v>${value / 100}</v></c>`;
-  const { first, end, totalRow } = result.pasteRange;
-  const summary = [
-    row(1, label("A1", "Cashier's Check Reconciliation · proposed", 1)),
-    row(2, label("A2", "For " + result.month)),
-    row(5, label("A5", "Closing account balance") + number("E5", result.balance / 100)),
-    row(9, label("A9", "Proposed checks outstanding") + formula("E9", "'Checks Outstanding'!D" + totalRow, result.total)),
-    row(13, label("A13", "Reviewed line item total") + number("E13", result.adjustments / 100)),
-    row(17, label("A17", "Reconciled balance") + formula("E17", "E5+E13", result.adjusted)),
-    row(18, label("A18", "Proposed difference") + formula("E18", "E9-E17", result.difference)),
-    row(21, label("A21", "Draft history") + label("B21", result.draft)),
-    row(22, label("A22", "Prior outstanding") + label("B22", result.prior)),
-    row(23, label("A23", "Closing balance source") + label("B23", result.closingSource)),
-    ...(result.cover.file ? [row(24, label("A24", "Prepared reconciliation") + label("B24", result.cover.file))] : []),
-    row(25, label("A25", "First outstanding paste row") + number("B25", first)),
-    row(26, label("A26", "Opening outstanding total") + number("B26", result.openingTotal / 100)),
-    ...(result.priorSaved !== undefined ? [row(27, label("A27", "Saved prior total") + number("B27", result.priorSaved / 100))] : []),
-    row(29, label("A29", "Completed by") + label("E29", audit.by)),
-    row(30, label("A30", "Completed on") + date("E30", audit.on)),
-  ].join("");
-  const checkList = (title, items, end, totalRow, total) => [
-    row(1, label("B1", title, 1)),
-    row(3, label("B3", "Date Written", 1) + label("C3", "Account Number", 1)
-      + label("D3", "Check Amount", 1) + label("E3", "Check Number", 1) + label("F3", "Reason", 1)),
-    ...items.map((item, i) => {
-      const r = i + first;
-      return row(r, date("B" + r, item.written ?? item.date) + label("C" + r, item.account ?? "")
-        + number("D" + r, item.amount / 100) + label("E" + r, item.reference) + label("F" + r, item.reason ?? ""));
-    }),
-    row(totalRow, label("B" + totalRow, "Total") + formula("D" + totalRow, "SUM(D" + first + ":D" + end + ")", total)),
-  ].join("");
-  const outstanding = checkList("Proposed checks outstanding", result.outstanding, end, totalRow, result.total);
-  const openingEnd = Math.max(first, first + result.opening.length - 1);
-  const opening = checkList("Opening checks from the prior month", result.opening, openingEnd, openingEnd + 1, result.openingTotal);
-  const columnHeaders = (names, columns, r = 1) => names.map((name, i) => label(columns[i] + r, name, 1)).join("");
-  const includedHistory = result.history.filter(item => item.disposition !== "exclude");
-  const history = [
-    row(1, label("A1", "Draft history · " + result.month, 1)),
-    row(2, columnHeaders(["Date", "Reference", "Txn", "Amount"], "ABCD", 2)
-      + columnHeaders(["Date", "Reference", "Txn", "Amount"], "FGHI", 2)),
-    ...includedHistory.map((item, i) => {
-      const r = i + 3;
-      const columns = item.amount >= 0 ? "ABCD" : "FGHI";
-      return row(r, date(columns[0] + r, item.date) + label(columns[1] + r, item.reference)
-        + label(columns[2] + r, item.code) + number(columns[3] + r, item.amount / 100));
-    }),
-  ].join("");
-  function auditRows(entries) {
-    return row(1, columnHeaders(["Source", "Source row", "Date", "Reference", "Code", "Amount", "Result"], "ABCDEFG"))
-      + entries.map(([item, outcome], i) => {
-        const r = i + 2;
-        return row(r, label("A" + r, item.source) + number("B" + r, item.row) + label("C" + r, item.written ?? item.date)
-          + label("D" + r, item.reference) + label("E" + r, item.code) + number("F" + r, item.amount / 100) + label("G" + r, outcome));
-      }).join("");
+  const [year, number] = result.month.split("-");
+  const updates = [["Reconciliation", "A2", "For " + ckMonthNames[Number(number) - 1] + " " + year]];
+  if (book.balanceRow) updates.push(["Reconciliation", "E" + book.balanceRow, result.balance / 100]);
+  if (book.completedRow) updates.push(["Reconciliation", "E" + book.completedRow, audit.by], ["Reconciliation", "E" + (book.completedRow + 1), { date: audit.on }]);
+  for (const row of result.clearRows) for (const column of ["B", "C", "D", "E", "F"]) if (book.outCells.has(column + row)) updates.push(["Checks Outstanding", column + row, null]);
+  // New outstanding items go in their year's section of Checks Outstanding, in the first empty rows.
+  const taken = new Set();
+  const notes = [];
+  for (const entry of result.added) {
+    const section = book.years.filter(item => item.year === Number(entry.date.slice(0, 4))).at(-1);
+    const next = section && (book.years.find(item => item.row > section.row)?.row ?? book.totalRow);
+    let row;
+    for (let r = section ? section.row + 1 : Infinity; r < next; r++) {
+      if (taken.has(r) || book.outCells.get("D" + r) !== undefined && !result.clearRows.includes(r) || ckText(book.outCells.get("B" + r))) continue;
+      row = r;
+      break;
+    }
+    if (!row) { notes.push("Add " + entry.code + " " + ckMoney.format(entry.amount / 100) + " (" + entry.date + ") to Checks Outstanding by hand: no empty row in its year."); continue; }
+    taken.add(row);
+    updates.push(["Checks Outstanding", "B" + row, { date: entry.date }], ["Checks Outstanding", "D" + row, entry.amount / 100], ["Checks Outstanding", "E" + row, entry.code]);
   }
-  const matched = result.matches.flatMap((group, i) => group.map(item => [item, "Match " + (i + 1)]));
-  const pasteRows = [
-    row(1, columnHeaders(["Sheet", "Cell", "Input", "Value", "Source"], "ABCDE")),
-    row(2, label("A2", "Reconciliation") + label("B2", "E5") + label("C2", "Closing account balance")
-      + number("D2", result.balance / 100) + label("E2", result.closingSource)),
-  ];
-  const lineRows = [row(1, columnHeaders(["Reviewed cover cell", "Description", "Amount"], "ABC")),
-    ...result.cover.items.map(([address, description, amount], i) => {
-      const r = i + 2;
-      return row(r, label("A" + r, address) + label("B" + r, description) + number("C" + r, amount / 100));
-    })];
-  const corrections = result.history.filter(item => item.originalReference !== undefined);
-  const correctionRows = [row(1, columnHeaders(["Draft worksheet", "Source row", "Date", "Original reference", "Reviewed reference"], "ABCDE")),
-    ...corrections.map((item, i) => {
-      const r = i + 2;
-      return row(r, label("A" + r, result.draftSheet) + number("B" + r, item.row) + date("C" + r, item.date)
-        + label("D" + r, item.originalReference) + label("E" + r, item.reference));
-    })];
-  const decisions = result.history.filter(item => item.disposition).map(item => [item,
-    item.disposition === "carry" ? "Carry as outstanding" : "Exclude from this reconciliation"]);
-  const fundingRows = [row(1, columnHeaders(["Review", "Debit row", "Debit date", "Txn", "Funding row", "Funding date", "Amount"], "ABCDEFG")),
-    ...result.fundingReview.map(({ debit, funding, type }, index) => {
-      const r = index + 2;
-      return row(r, label("A" + r, type) + number("B" + r, debit.row) + date("C" + r, debit.date) + label("D" + r, debit.code)
-        + number("E" + r, funding.row) + date("F" + r, funding.date) + number("G" + r, funding.amount / 100));
-    })];
-  return createExcelWorkbook([
-    ["Reconciliation", worksheet("A1:E30", [[1, 1, 38], [2, 4, 20], [5, 5, 18]], summary)],
-    ["Paste cells", worksheet("A1:E2", [[1, 1, 22], [2, 2, 10], [3, 3, 25], [4, 4, 16], [5, 5, 45]], pasteRows.join(""))],
-    ...completionPasteSheets(result.cover.auditTarget, audit),
-    ...(result.cover.file ? [["Reviewed cover items", worksheet("A1:C" + lineRows.length, [[1, 1, 22], [2, 2, 45], [3, 3, 16]], lineRows.join(""))]] : []),
-    ["Opening checks", worksheet("B1:F" + (openingEnd + 1), [[2, 5, 19], [6, 6, 50]], opening)],
-    ["Checks Outstanding", worksheet("B1:F" + totalRow, [[2, 5, 19], [6, 6, 50]], outstanding)],
-    ["CC Worksheet", worksheet("A1:I" + (includedHistory.length + 2), [[1, 9, 17]], history)],
-    ["Matches", worksheet("A1:G" + (matched.length + 1), [[1, 6, 18], [7, 7, 45]], auditRows(matched))],
-    ["Exceptions", worksheet("A1:G" + (result.exceptions.length + 1), [[1, 6, 18], [7, 7, 48]], auditRows(result.exceptions))],
-    ...(result.fundingReview.length ? [["Journal funding review", worksheet("A1:G" + fundingRows.length,
-      [[1, 1, 38], [2, 7, 16]], fundingRows.join(""))]] : []),
-    ...(corrections.length ? [["Reference corrections", worksheet("A1:E" + correctionRows.length,
-      [[1, 1, 24], [2, 3, 15], [4, 5, 22]], correctionRows.join(""))]] : []),
-    ...(decisions.length ? [["Reviewed draft decisions", worksheet("A1:G" + (decisions.length + 1),
-      [[1, 6, 18], [7, 7, 43]], auditRows(decisions))]] : []),
-  ], audit);
+  const block = ckBlock(book, result);
+  let blob = await fillExcelTemplate(book.file, updates, [block.append]);
+  const marks = block.marks.map(mark => ({ sheet: "CC Worksheet", address: mark.column + (block.append.startRow + mark.row - 1), color: "FFFF7C80" }));
+  if (marks.length) blob = await excelFillCells(blob, book.file.name, marks);
+  return { blob, notes };
 }
 
-for (const [kind, select] of [["draft", selectDraft], ["prior", selectPriorChecks],
-  ["closing", file => selectCheckCover("closing", file)], ["cover", file => selectCheckCover("cover", file)]]) {
-  const input = checkField(kind + "-file");
-  const drop = checkField(kind + "-drop");
-  input.addEventListener("change", () => select(input.files[0]));
+for (const kind of ["book", "history"]) {
+  const input = ckField(kind + "-file"), drop = ckField(kind + "-drop");
+  const select = files => {
+    ckFiles[kind] = files[0];
+    ckField(kind + "-status").textContent = files[0]?.name ?? "";
+    ckResult = undefined;
+    ckField("results").hidden = true;
+  };
+  input.addEventListener("change", () => select(input.files));
   drop.addEventListener("dragover", event => { event.preventDefault(); drop.classList.add("active"); });
   drop.addEventListener("dragleave", () => drop.classList.remove("active"));
-  drop.addEventListener("drop", event => {
-    event.preventDefault();
-    drop.classList.remove("active");
-    if (event.dataTransfer.files.length !== 1) return checkStatus("Drop one workbook at a time.", true);
-    input.value = "";
-    select(event.dataTransfer.files[0]);
-  });
+  drop.addEventListener("drop", event => { event.preventDefault(); drop.classList.remove("active"); input.value = ""; select(event.dataTransfer.files); });
 }
 document.addEventListener("dragover", event => event.preventDefault());
 document.addEventListener("drop", event => event.preventDefault());
-for (const input of document.querySelectorAll("input:not([type=file]), select, textarea")) input.addEventListener("input", invalidateChecks);
-checkField("draft-sheet").addEventListener("change", () => {
-  suggestDraftCheckColumns().catch(error => { checkField("draft-status").textContent = error.message; });
-});
 
-checkField("run").addEventListener("click", async () => {
-  invalidateChecks();
-  const revision = checkRevision;
+ckField("run").addEventListener("click", async () => {
+  const current = ++ckRevision;
+  ckResult = undefined;
+  ckField("results").hidden = true;
   try {
-    const month = checkField("month").value;
-    requireReport(month && draftBook, "Choose the month and load the draft history.");
-    requireReport(Boolean(priorFile) !== checkField("empty-prior").checked, "Load the prior workbook or confirm that the prior outstanding list is empty.");
-    const columns = ["date", "code", "reference", "amount"].map(name => checkField(name + "-column").value.trim().toUpperCase());
-    requireReport(columns.every(column => /^[A-Z]{1,3}$/.test(column) && columnNumber(column) <= 16384)
-      && new Set(columns).size === 4, "Enter four different Excel column letters.");
-    const first = checkField("first-row").valueAsNumber;
-    const last = checkField("last-row").value ? checkField("last-row").valueAsNumber : 1048576;
-    requireReport(Number.isInteger(first) && Number.isInteger(last) && first >= 1 && last >= first && last <= 1048576,
-      "Check the first and last data rows.");
-    checkStatus("Comparing the draft history and prior checks…");
-    const draftSheet = checkField("draft-sheet").value;
-    const [draft, prior, closing, cover] = await Promise.all([
-      readDraftChecks(draftBook, draftSheet, columns, first, last, month),
-      readPriorChecks(priorFile, month),
-      readCheckClosing(month, checkCoverFiles.closing),
-      readCheckCover(month, checkCoverFiles.cover),
-    ]);
-    if (revision !== checkRevision) return;
-    for (const { item, value } of draftReviewRows(draft, checkField("reference-corrections").value, "Correction")) {
-      item.originalReference = item.reference;
-      item.reference = value;
-    }
-    for (const { item, value } of draftReviewRows(draft, checkField("draft-decisions").value, "Decision")) {
-      const action = value.toLowerCase();
-      requireReport(action === "carry" || action === "exclude", "Use Carry or Exclude for draft row " + item.row + ".");
-      requireReport(action !== "carry" || item.kind === "issued", "Only a positive SU issue can be carried from draft row " + item.row + ".");
-      item.disposition = action;
-      if (action === "carry") item.reason = "Reviewed carryover";
-    }
-    requireReport(draft.length || prior.entries.length || prior.outside.length, "There are no checks for the selected period.");
-    requireReport(prior.entries.every(item => !item.date || item.date.slice(0, 7) < month), "The prior outstanding workbook contains checks dated in or after the selected month.");
-    const comparison = reconcileChecks(prior.entries, draft);
-    const fundingReview = suggestCheckFunding(draft, closing.accountHistory, month);
-    comparison.exceptions.push(...prior.outside.map(item => [item, "Outside the prior workbook's outstanding total range"]));
-    const total = comparison.outstanding.reduce((sum, item) => sum + item.amount, 0);
-    const openingTotal = prior.entries.reduce((sum, item) => sum + item.amount, 0), priorSaved = prior.range?.savedTotal;
-    const destination = cover.destination ?? prior.range;
-    const firstPaste = destination?.first ?? 4, lastCheck = firstPaste + comparison.outstanding.length - 1;
-    const end = Math.max(firstPaste, lastCheck, destination?.last ?? 0);
-    const pasteRange = { first: firstPaste, end, totalRow: Math.max(end + 1, destination?.totalRow ?? 4),
-      overflow: Boolean(destination && lastCheck > destination.last) };
-    const { value: balance, source: closingSource } = closing, { adjustments } = cover;
-    const adjusted = balance + adjustments, difference = total - adjusted;
-    requireReport([total, openingTotal, adjustments, adjusted, difference].every(Number.isSafeInteger), "The totals exceed the supported amount range.");
-    checkResult = { ...comparison, month, balance, closingSource, cover, adjustments, total, adjusted, difference, history: draft, fundingReview, opening: prior.entries,
-      openingTotal, priorSaved, priorCount: prior.entries.length, pasteRange,
-      draft: draftFile.name, draftSheet, prior: priorFile?.name ?? "None confirmed" };
-    displayChecks(checkResult);
-    checkStatus(priorSaved !== undefined && priorSaved !== openingTotal ? "The saved prior total differs from the imported opening rows. Review before pasting."
-      : comparison.exceptions.length ? "Review the exceptions before using the proposed balances." : "Proposed balances are ready for review.");
+    const month = ckField("month").value;
+    requireReport(month && ckField("confirm").checked, "Choose the month and confirm the source files.");
+    requireReport(ckFiles.book && ckFiles.history, "Load last month's reconciliation and the 903 draft history.");
+    const [book, history] = await Promise.all([ckReadBook(ckFiles.book), ckReadHistory(ckFiles.history)]);
+    if (current !== ckRevision) return;
+    const result = ckReconcile(book, history, month);
+    ckResult = { book, result };
+    ckShow(result);
+    ckStatus(result.issues.length ? "Review the items listed below before using the workbook." : "");
   } catch (error) {
-    if (revision === checkRevision) checkStatus(error.message, true);
+    if (current === ckRevision) ckStatus(error.message, true);
   }
 });
 
-function fillChecksTemplate(result) {
-  const audit = reconciliationAudit(), cover = result.cover;
-  const updates = [["Reconciliation", "E5", result.balance / 100]];
-  if (cover.auditTarget) {
-    const { sheet, initials, date } = cover.auditTarget;
-    updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
-  }
-  if (cover.outstanding && !result.pasteRange.overflow) {
-    const { range, cells, formulas } = cover.outstanding;
-    const entries = result.outstanding.map(item => [
-      item.date ? { date: item.date } : item.written || null, item.account || null, item.amount / 100, item.reference || null, item.reason || null,
-    ]);
-    updates.push(...templateTableUpdates("Checks Outstanding", range, "BCDEF", entries, cells, formulas));
-  }
-  return fillExcelTemplate(cover.template, updates);
-}
-
-async function downloadChecks(button, build, name) {
-  const result = checkResult;
-  if (!result) return;
-  button.disabled = true;
+ckField("download").addEventListener("click", async event => {
+  const state = ckResult;
+  if (!state) return;
+  event.currentTarget.disabled = true;
   try {
-    const blob = await build(result);
-    if (checkResult !== result) return;
+    const { blob, notes } = await ckBuild(state.book, state.result);
+    if (notes.length) ckStatus(notes.join(" "), true);
+    // Named for the month it is prepared in, like the saved workbooks (September's reconciliation is 10-2026).
+    const [year, number] = state.result.month.split("-").map(Number);
+    const prepared = String(number % 12 + 1).padStart(2, "0") + "-" + (number === 12 ? year + 1 : year);
+    const name = /^\d{2}-\d{4}/.test(state.book.file.name) ? state.book.file.name.replace(/^\d{2}-\d{4}/, prepared) : prepared + " " + state.book.file.name;
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = name(result);
+    link.download = name;
     document.body.append(link);
     link.click();
     link.remove();
     setTimeout(() => URL.revokeObjectURL(link.href), 30000);
   } catch (error) {
-    if (checkResult === result) checkStatus(error.message, true);
+    ckStatus(error.message, true);
   } finally {
-    button.disabled = false;
+    event.currentTarget.disabled = false;
   }
-}
-
-checkField("download").addEventListener("click", event =>
-  downloadChecks(event.currentTarget, buildChecks, result => "Cashiers Checks " + result.month + ".xlsx"));
-checkField("download-template").addEventListener("click", event =>
-  downloadChecks(event.currentTarget, fillChecksTemplate,
-    result => "Cashiers Checks " + result.month + " filled draft." + result.cover.file.split(".").at(-1)));
+});
