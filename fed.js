@@ -1087,11 +1087,15 @@ fedField("run").addEventListener("click", async () => {
     const sentReports = await Promise.all(sentRoles.map(role => readSentFiles(dailyFiles[role], date, role === "sent-prior", includeApproved)));
     if (current !== dailyRevision) return;
     const dates = new Set([date]);
+    // Yesterday's workbook is rolled forward to today (today's rows added, formulas dragged down, date set).
+    const roll = dailyFiles.template ? await fedRollForward(dailyFiles.template, date) : undefined;
+    const templateFile = roll?.file;
+    if (current !== dailyRevision) return;
     const [statement, ledgerRows, template] = await Promise.all([
       /\.(?:pdf|txt)$/i.test(dailyFiles.statement.name) ? readFedStatement(dailyFiles.statement, date)
         : readDailySource(dailyFiles.statement, dates, "statement", 1),
       readDailySource(dailyFiles.ledger, new Set([date, postingDate]), "ledger", sign),
-      dailyFiles.template ? readDailyTemplate(dailyFiles.template, date, sentReports, returnReports) : undefined,
+      templateFile ? readDailyTemplate(templateFile, date, sentReports, returnReports) : undefined,
     ]);
     if (current !== dailyRevision) return;
     const ledger = ledgerRows.filter(item => item.date === date);
@@ -1125,7 +1129,7 @@ fedField("run").addEventListener("click", async () => {
     }
     const references = [...dailyReferences, ...["returns-current", "returns-prior"].map(role => dailyFiles[role]?.name)
       .filter(name => name && !returnReports.some(report => report.name === name))];
-    const templateSource = dailyFiles.template;
+    const templateSource = templateFile;
     const result = { date, statementBalance, rawLedgerBalance, ledgerBalance, adjustments, adjusted, difference, template, activity, exceptions, vizo, finance, clearing, sentReports, returnReports, references, templateSource,
       statementFile: dailyFiles.statement.name, ledgerFile: dailyFiles.ledger.name, templateFile: templateSource?.name ?? "",
       ...compareDaily(statement, ledger, template, finance, effectiveDateHistory) };
@@ -1168,7 +1172,9 @@ function fillDailyTemplate(result) {
     const { sheet, initials, date } = result.template.auditTarget;
     updates.push([sheet, initials, audit.by], [sheet, date, { date: audit.on }]);
   }
-  return fillExcelTemplate(result.templateSource, updates);
+  return fillExcelTemplate(result.templateSource, updates)
+    .then(blob => fedApplyCoverItems(blob, result.templateSource.name, fedCoverItems(result)))
+    .then(({ blob }) => blob);
 }
 
 async function downloadDaily(button, build, name) {
