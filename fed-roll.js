@@ -56,6 +56,13 @@ async function fedSheetEditor(workbook, sheet) {
     if (type === "str") return v?.textContent;
     return v ? Number(v.textContent) : undefined;
   };
+  // Shared formulas become each cell's own formula, so rows can be moved or overwritten without breaking a shared group.
+  for (const f of Array.from(doc.getElementsByTagNameNS(spreadsheetNs, "f")).filter(node => node.getAttribute("t") === "shared")) {
+    const text = formulaOf(f.parentNode);
+    if (text === undefined) continue;
+    f.textContent = text;
+    for (const name of ["t", "si", "ref"]) f.removeAttribute(name);
+  }
   const element = (parent, name) => doc.createElementNS(spreadsheetNs, parent.prefix ? parent.prefix + ":" + name : name);
   const rowNode = row => {
     if (rows.has(row)) return rows.get(row);
@@ -127,12 +134,34 @@ async function fedSheetEditor(workbook, sheet) {
       setNumber(column + to, value, above?.getAttribute("s"));
     }
   };
+  // Moves a whole row (values, labels, dates and shifted formulas) to another row.
+  const moveRow = (from, to) => {
+    if (from === to) return;
+    for (const node of cellsOf(from)) {
+      const { column } = parse(node.getAttribute("r")), address = column + to, style = node.getAttribute("s");
+      const formula = formulaOf(node), value = valueOf(node);
+      if (formula !== undefined) setFormula(address, fedShiftFormula(formula, to - from), style);
+      else if (typeof value === "string") setText(address, value, style);
+      else if (typeof value === "number") setNumber(address, value, style);
+      else setBlank(address, style);
+    }
+  };
+  // Empties a row, keeping its formats and (optionally) its formulas.
+  const clearRow = (row, keepFormulas) => {
+    for (const node of cellsOf(row)) {
+      const address = node.getAttribute("r"), style = node.getAttribute("s"), formula = formulaOf(node);
+      if (keepFormulas && formula !== undefined) setFormula(address, formula, style);
+      else setBlank(address, style);
+    }
+  };
   const save = () => workbook.zip.file(path, new XMLSerializer().serializeToString(doc));
-  return { rows, cellsOf, cell, valueOf, formulaOf, copyRow, setNumber, setText, setFormula, save, parse };
+  return { rows, cellsOf, cell, valueOf, formulaOf, copyRow, moveRow, clearRow, setNumber, setText, setFormula, save, parse };
 }
 
 // In VIZO MATCHUP a row's amounts default to 0 only on the side (VIZO A-D, Wisdom E-H) that gets today's date.
 const fedZeroSide = (column, dates) => columnNumber(column) < columnNumber("E") ? "A" in dates : columnNumber(column) < columnNumber("K") ? "E" in dates : "K" in dates;
+
+const fedMonthOf = serial => new Date(Date.UTC(1899, 11, 30) + serial * 86400000).toISOString().slice(0, 7);
 
 const fedIsDate = value => typeof value === "number" && Number.isInteger(value) && value > 40000 && value < 60000;
 
@@ -148,6 +177,26 @@ function fedRollMatchup(sheet, date) {
   requireReport(lastRow.has("ach out") && lastRow.has("wire out") && lastRow.has("wire in"), "Yesterday's MATCHUP sheet has no dated ACH and wire rows.");
   const last = sheet.valueOf(sheet.cell("A" + lastRow.get("ach out")));
   requireReport(serial > last, "Yesterday's workbook already has rows for " + date + " or later.");
+  // First business day of a new month: each block keeps only last month's final day, moved to the top of the block.
+  if (fedMonthOf(last) !== date.slice(0, 7)) {
+    const firstRow = new Map();
+    for (const [row] of [...sheet.rows].sort((a, b) => a[0] - b[0])) {
+      const name = label(row);
+      if (fedRollCategories.includes(name) && fedIsDate(sheet.valueOf(sheet.cell("A" + row))) && !firstRow.has(name)) firstRow.set(name, row);
+    }
+    const achTop = firstRow.get("ach in"), achOut = lastRow.get("ach out");
+    sheet.moveRow(achOut - 1, achTop);
+    sheet.moveRow(achOut, achTop + 1);
+    for (let row = achTop + 2; row <= achOut; row++) sheet.clearRow(row, false);
+    lastRow.set("ach in", achTop).set("ach out", achTop + 1);
+    for (const name of ["wire out", "wire in", "fednow in", "fednow out"]) {
+      if (!lastRow.has(name)) continue;
+      const top = firstRow.get(name), bottom = lastRow.get(name);
+      sheet.moveRow(bottom, top);
+      for (let row = top + 1; row <= bottom; row++) sheet.clearRow(row, true);
+      lastRow.set(name, top);
+    }
+  }
   const free = row => sheet.cellsOf(row).every(node => {
     const value = sheet.valueOf(node);
     return value === undefined || value === "" || sheet.formulaOf(node) !== undefined;
@@ -180,8 +229,17 @@ function fedRollVizo(sheet, date) {
     const columns = ["A", "E", "K"].filter(column => block.some(row => fedIsDate(sheet.valueOf(sheet.cell(column + row)))));
     const lastDated = Math.max(0, ...columns.flatMap(column => block.filter(row => fedIsDate(sheet.valueOf(sheet.cell(column + row))))));
     const latest = Math.max(0, ...columns.flatMap(column => block.map(row => sheet.valueOf(sheet.cell(column + row))).filter(fedIsDate)));
+    let lastRowInBlock = lastDated;
+    if (columns.length && latest < serial && fedMonthOf(latest) !== date.slice(0, 7)) {
+      // New month: keep the rows of last month's final day at the top of the block.
+      const keep = block.filter(row => columns.some(column => sheet.valueOf(sheet.cell(column + row)) === latest));
+      const top = block[0], from = Math.min(...keep);
+      for (let row = from; row <= lastDated; row++) sheet.moveRow(row, top + row - from);
+      for (let row = top + lastDated - from + 1; row <= lastDated; row++) sheet.clearRow(row, true);
+      lastRowInBlock = top + lastDated - from;
+    }
     if (columns.length && latest < serial) {
-      const to = lastDated + 1;
+      const to = lastRowInBlock + 1;
       requireReport(to < end && !/^date$/i.test(String(sheet.valueOf(sheet.cell("A" + to)) ?? "")), "VIZO MATCHUP has no free row at " + to + ". Add rows to that block, then try again.");
       targets.set(to, Object.fromEntries(columns.map(column => [column, serial])));
     }
