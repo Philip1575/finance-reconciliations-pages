@@ -120,6 +120,12 @@ async function fedSheetEditor(workbook, sheet) {
       else if (zero && typeof value === "number" && !fedIsDate(value) && fedZeroSide(column, dates)) setNumber(address, 0, style);
       else setBlank(address, style);
     }
+    // A date column the source row leaves empty still gets today's date, formatted like the date above it.
+    for (const [column, value] of Object.entries(dates)) {
+      if (value === undefined || cellsOf(from).some(node => parse(node.getAttribute("r")).column === column)) continue;
+      const above = [from - 1, from - 2, from - 3].map(row => cell(column + row)).find(node => node && fedIsDate(valueOf(node)));
+      setNumber(column + to, value, above?.getAttribute("s"));
+    }
   };
   const save = () => workbook.zip.file(path, new XMLSerializer().serializeToString(doc));
   return { rows, cellsOf, cell, valueOf, formulaOf, copyRow, setNumber, setText, setFormula, save, parse };
@@ -168,15 +174,16 @@ function fedRollVizo(sheet, date) {
   heads.forEach((head, index) => {
     const end = heads[index + 1] ?? Infinity;
     const block = sorted.filter(row => row > head && row < end);
+    // Today's date goes on one new row, in every date column the block uses. Blocks whose Wisdom dates ran a row behind
+    // (mobile) line up again: Wisdom deposits are compared with the next day's VIZO row, the same as branch deposits.
     const targets = new Map();
-    for (const column of ["A", "E", "K"]) {
-      const dated = block.filter(row => fedIsDate(sheet.valueOf(sheet.cell(column + row))));
-      if (!dated.length) continue;
-      const last = dated.at(-1);
-      if (sheet.valueOf(sheet.cell(column + last)) >= serial) continue;
-      const to = last + 1;
+    const columns = ["A", "E", "K"].filter(column => block.some(row => fedIsDate(sheet.valueOf(sheet.cell(column + row)))));
+    const lastDated = Math.max(0, ...columns.flatMap(column => block.filter(row => fedIsDate(sheet.valueOf(sheet.cell(column + row))))));
+    const latest = Math.max(0, ...columns.flatMap(column => block.map(row => sheet.valueOf(sheet.cell(column + row))).filter(fedIsDate)));
+    if (columns.length && latest < serial) {
+      const to = lastDated + 1;
       requireReport(to < end && !/^date$/i.test(String(sheet.valueOf(sheet.cell("A" + to)) ?? "")), "VIZO MATCHUP has no free row at " + to + ". Add rows to that block, then try again.");
-      targets.set(to, { ...(targets.get(to) ?? {}), [column]: serial });
+      targets.set(to, Object.fromEntries(columns.map(column => [column, serial])));
     }
     for (const [to, dates] of [...targets].sort((a, b) => a[0] - b[0])) {
       const all = { A: undefined, E: undefined, K: undefined, ...dates };
