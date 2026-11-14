@@ -3,91 +3,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>LoanStreet reconciliation | Finance Reconciliations</title>
-  <link rel="stylesheet" href="style.css">
-  <script defer src="jszip.min.js"></script>
-  <script defer src="loanstreet.js"></script>
-  <script defer src="covers.js"></script>
-  <script defer src="details.js"></script>
-  <script defer src="profile.js"></script>
-  <script defer src="app.js"></script>
+  <meta name="robots" content="noindex, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' blob:; style-src 'self' blob:; img-src 'self' blob: data:; font-src 'self' blob: data:; connect-src 'self'; worker-src 'self' blob:; base-uri 'none'; form-action 'none'">
+  <title>Finance Reconciliations</title>
+  <link rel="stylesheet" href="gate.css">
+  <script defer src="gate.js"></script>
 </head>
 <body>
-  <main>
-    <header>
-      <p class="organization">Finance Reconciliations</p>
-      <nav aria-label="Reconciliations"><a href="index.html" aria-current="page">LoanStreet</a><a href="checks.html">Cashier's checks</a><a href="vizo-batch.html">VIZO</a><a href="lendkey.html">LendKey</a><a href="student.html">Student Choice</a><a href="fed.html">Federal Reserve</a><a href="suspense.html">Suspense</a></nav>
-      <h1>LoanStreet reconciliation</h1>
-      <p>Prepare monthly KEY INFO and cover-sheet balances.</p>
-    </header>
-    <section class="panel" aria-labelledby="profile-heading">
-      <h2 id="profile-heading">LoanStreet workbook mapping</h2>
-      <div id="profile-drop" class="drop">
-        <label for="profile">Drop a completed consolidated LoanStreet workbook or local mapping profile</label>
-        <input type="file" id="profile" accept=".xlsx,.json">
-      </div>
-      <p id="profile-status" role="status">The workbook supplies the account, pool and worksheet mappings for this session.</p>
-    </section>
-    <section class="panel" aria-labelledby="input-heading">
-      <h2 id="input-heading">Provider report</h2>
-      <label for="month">Reconciliation month</label>
-      <input type="month" id="month" required>
-      <div id="drop" class="drop">
-        <label for="report">Drop a Buy Side Combined Report here</label>
-        <input type="file" id="report" accept=".xlsx">
-        <p>Excel .xlsx · processed on this device</p>
-      </div>
-      <p id="status" role="status" aria-live="polite"></p>
-    </section>
-    <section class="panel" aria-labelledby="detail-heading">
-      <h2 id="detail-heading">Prepared consolidated workbook</h2>
-      <p>Optional. Copy the previous month’s detail blocks and rename the new headings. Include the year, such as September 2026, to check it automatically. Select that copy to get exact paste addresses.</p>
-      <label for="detail-file">Consolidated LoanStreet workbook (.xlsx)</label>
-      <input type="file" id="detail-file" accept=".xlsx">
-      <p id="detail-status" role="status" aria-live="polite"></p>
-      <button type="button" id="detail-clear" hidden>Remove detail workbook</button>
-    </section>
-    <section class="panel" aria-labelledby="wisdom-heading">
-      <h2 id="wisdom-heading">Wisdom trial balance</h2>
-      <div id="wisdom-drop" class="drop">
-        <label for="wisdom-file">Drop the month’s Wisdom trial balance workbook or workbooks</label>
-        <input type="file" id="wisdom-file" accept=".xlsx,.xlsm" multiple>
-        <p>Excel .xlsx or .xlsm · optional for provider-only output</p>
-      </div>
-      <div id="wisdom-mapping" hidden>
-        <p>Use the same account and balance columns and data row range in each workbook.</p>
-        <div class="mapping">
-          <label>Worksheet<select id="wisdom-sheet"></select></label>
-          <label>G/L account column<input id="wisdom-account" placeholder="e.g. A" maxlength="3"></label>
-          <label>Ending balance column<input id="wisdom-balance" placeholder="e.g. F" maxlength="3"></label>
-          <label>First data row<input id="wisdom-first" type="number" min="1" max="1048576" value="2"></label>
-          <label>Last data row (optional)<input id="wisdom-last" type="number" min="1" max="1048576"></label>
-        </div>
-        <label class="confirmation"><input id="wisdom-confirm" type="checkbox">
-          I verified the selected columns, month, and that these are the ending balances after the month-end entries.
-        </label>
-      </div>
-      <p id="wisdom-status" role="status" aria-live="polite"></p>
-      <button type="button" id="wisdom-clear" hidden>Remove Wisdom file</button>
-    </section>
-    <section class="panel" id="preview" aria-labelledby="output-heading" hidden>
-      <div class="output">
-        <div>
-          <h2 id="output-heading">Excel preview</h2>
-          <p id="period"></p>
-        </div>
-        <button type="button" id="download">Download review Excel</button>
-        <button type="button" id="download-template" hidden>Download filled LoanStreet workbook</button>
-      </div>
-      <div id="table" class="table" tabindex="0" role="region" aria-label="Pool balances"></div>
-      <p id="template-download-note" hidden></p>
-      <p>In your copied monthly KEY INFO worksheet, paste values from <strong>G3:N10</strong> and <strong>G12</strong> into the same cells. Check that the pool headers match first.</p>
-      <p>Use the <strong>Cover inputs</strong> sheet to find the exact provider and ledger cells to paste into each existing cover. Paste only the listed cells.</p>
-      <p>When provided, <strong>Cover period inputs</strong> lists the month labels to update in the prepared covers.</p>
-      <p>Use <strong>Detail inputs</strong> for the five provider amounts per pool. When a prepared workbook is selected, review the current values and proposed changes before pasting the listed cells.</p>
-    </section>
-    <aside>Draft inputs for finance review. Check roll-forwards, adjustments, and the final reconciliation in your existing workbook.</aside>
+  <main class="gate" id="gate" hidden>
+    <h1>Finance Reconciliations</h1>
+    <form id="gate-form">
+      <label for="gate-password">Password</label>
+      <input id="gate-password" type="password" autocomplete="current-password" required>
+      <label class="gate-remember"><input id="gate-remember" type="checkbox"> Keep me unlocked on this computer</label>
+      <button type="submit" id="gate-submit">Unlock</button>
+      <p id="gate-status" role="status" aria-live="polite"></p>
+    </form>
   </main>
+  <p class="gate-loading" id="gate-loading">Opening…</p>
 </body>
 </html>

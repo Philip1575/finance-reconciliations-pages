@@ -3,50 +3,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>Cashier's checks | Finance Reconciliations</title>
-  <link rel="stylesheet" href="style.css">
-  <script defer src="jszip.min.js"></script>
-  <script defer src="loanstreet.js"></script>
-  <script defer src="covers.js"></script>
-  <script defer src="financial.js"></script>
-  <script defer src="checks.js"></script>
+  <meta name="robots" content="noindex, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' blob:; style-src 'self' blob:; img-src 'self' blob: data:; font-src 'self' blob: data:; connect-src 'self'; worker-src 'self' blob:; base-uri 'none'; form-action 'none'">
+  <title>Finance Reconciliations</title>
+  <link rel="stylesheet" href="gate.css">
+  <script defer src="gate.js"></script>
 </head>
 <body>
-  <main>
-    <header>
-      <p class="organization">Finance Reconciliations</p>
-      <nav aria-label="Reconciliations"><a href="index.html">LoanStreet</a><a href="checks.html" aria-current="page">Cashier's checks</a><a href="vizo-batch.html">VIZO</a><a href="lendkey.html">LendKey</a><a href="student.html">Student Choice</a><a href="fed.html">Federal Reserve</a><a href="suspense.html">Suspense</a></nav>
-      <h1>Cashier's checks</h1>
-      <p>Adds the month to last month's reconciliation: the 903 draft history is matched (checks and journal entries written against the drafts and journals that cleared them), cleared checks come off the outstanding list, new ones go on, and the cover gets the month and the 903 balance.</p>
-    </header>
-    <section class="panel">
-      <div class="mapping">
-        <label>Reconciliation month<input id="month" type="month"></label>
-      </div>
-    </section>
-    <section class="panel" aria-labelledby="book-heading">
-      <h2 id="book-heading">Last month's reconciliation</h2>
-      <div class="drop" id="book-drop"><label for="book-file">Drop last month's Cashier's Check workbook</label><input id="book-file" type="file" accept=".xlsx,.xlsm"></div>
-      <p id="book-status" role="status"></p>
-    </section>
-    <section class="panel" aria-labelledby="history-heading">
-      <h2 id="history-heading">903 draft history</h2>
-      <div class="drop" id="history-drop"><label for="history-file">Drop the Portico draft history for the 903 account (suffix 2)</label><input id="history-file" type="file" accept=".xlsx,.xlsm,.csv"></div>
-      <p>Include at least the whole month; earlier months in the same export are fine.</p>
-      <p id="history-status" role="status"></p>
-    </section>
-    <section class="panel">
-      <label class="confirmation"><input id="confirm" type="checkbox"> I verified the month and source files.</label>
-      <button id="run" type="button">Prepare the reconciliation</button>
-      <p id="status" role="status" aria-live="polite"></p>
-    </section>
-    <section class="panel" id="results" hidden>
-      <div class="output"><h2>Cashier's check reconciliation</h2><button id="download" type="button">Download workbook</button></div>
-      <div id="summary" class="table"></div>
-      <div id="details" class="table"></div>
-      <p>The workbook is last month's with the month's block added to the CC Worksheet, the Checks Outstanding list updated and the cover filled. Rows highlighted red need review.</p>
-    </section>
+  <main class="gate" id="gate" hidden>
+    <h1>Finance Reconciliations</h1>
+    <form id="gate-form">
+      <label for="gate-password">Password</label>
+      <input id="gate-password" type="password" autocomplete="current-password" required>
+      <label class="gate-remember"><input id="gate-remember" type="checkbox"> Keep me unlocked on this computer</label>
+      <button type="submit" id="gate-submit">Unlock</button>
+      <p id="gate-status" role="status" aria-live="polite"></p>
+    </form>
   </main>
+  <p class="gate-loading" id="gate-loading">Opening…</p>
 </body>
 </html>

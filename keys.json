@@ -1,0 +1,14 @@
+{
+ "version": 1,
+ "iterations": 600000,
+ "slots": [
+  {
+   "salt": "xwcETPWu5ETgtGphAFpmng==",
+   "data": "1xk8U+WMLrZ1G/q1mt0H1ormbt3xOuxPoOc4RjkPymNLuHU8ScmCmSilpRWzWRmpXZjNhGXsg60xij7Up1KV/lnY/84dcMUOl+HW4dijpgi8oJO8z9bYwzCpy4nYEOrteiUNHCz/1SZXRQZKNvuuwuGysjT+O5nBediPmxFv+BA="
+  },
+  {
+   "salt": "XNCx4qgIWs66hK8MdpMA0w==",
+   "data": "6zIBYe56TYEIoZIUw1IeQKnb0bTFHC8lWav5vT80jx6PB3O8RPZC+N2WDmsdGh8PLngm95nvpIYI5SbwCwxJUmxMo1woJdQsXTcpOuiGSW7ueztYtchp+83iS7BjK1Dg/akkZFstlU1VdLMFHX5Np09pw1D3mgVHAvWjkbn2S1g="
+  }
+ ]
+}

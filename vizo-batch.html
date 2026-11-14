@@ -3,63 +3,23 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'">
-  <title>VIZO batch | Finance Reconciliations</title>
-  <link rel="stylesheet" href="style.css">
-  <script defer src="jszip.min.js"></script>
-  <script defer src="loanstreet.js"></script>
-  <script defer src="covers.js"></script>
-  <script defer src="financial.js"></script>
-  <script defer src="pdfjs-worker.js"></script>
-  <script defer src="pdfjs-display.js"></script>
-  <script defer src="lendkey-pdf.js"></script>
-  <script defer src="vizo-batch.js"></script>
+  <meta name="robots" content="noindex, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' blob:; style-src 'self' blob:; img-src 'self' blob: data:; font-src 'self' blob: data:; connect-src 'self'; worker-src 'self' blob:; base-uri 'none'; form-action 'none'">
+  <title>Finance Reconciliations</title>
+  <link rel="stylesheet" href="gate.css">
+  <script defer src="gate.js"></script>
 </head>
 <body>
-  <main>
-    <header>
-      <p class="organization">Finance Reconciliations</p>
-      <nav aria-label="Reconciliations"><a href="index.html">LoanStreet</a><a href="checks.html">Cashier's checks</a><a href="vizo-batch.html" aria-current="page">VIZO</a><a href="lendkey.html">LendKey</a><a href="student.html">Student Choice</a><a href="fed.html">Federal Reserve</a><a href="suspense.html">Suspense</a></nav>
-      <h1>VIZO batch</h1>
-      <p>Reconcile every VIZO account at once. Overdraft sweeps and transfers are paired across accounts, and the entries still needed in Wisdom are listed with their debit and credit G/Ls.</p>
-    </header>
-    <section class="panel">
-      <div class="mapping">
-        <label>Reconciliation month<input id="month" type="month"></label>
-      </div>
-    </section>
-    <section class="panel" aria-labelledby="vizo-heading">
-      <h2 id="vizo-heading">VIZO activity (all accounts)</h2>
-      <div class="drop" id="vizo-drop"><label for="vizo-file">Drop the month's VIZO export for all accounts, or one export per account (CSV or Excel)</label><input id="vizo-file" type="file" accept=".csv,.xlsx,.xlsm" multiple></div>
-      <p id="vizo-status" role="status"></p>
-    </section>
-    <section class="panel" aria-labelledby="wisdom-heading">
-      <h2 id="wisdom-heading">Wisdom activity (all VIZO G/Ls)</h2>
-      <div class="drop" id="wisdom-drop"><label for="wisdom-file">Drop the month's Wisdom Detailed Trial Balance for the VIZO G/Ls (one report or one per G/L)</label><input id="wisdom-file" type="file" accept=".xlsx,.xlsm" multiple></div>
-      <p id="wisdom-status" role="status"></p>
-    </section>
-    <section class="panel" aria-labelledby="books-heading">
-      <h2 id="books-heading">Last month's VIZO workbooks</h2>
-      <div class="drop" id="books-drop"><label for="books-file">Drop all of last month's VIZO workbooks</label><input id="books-file" type="file" accept=".xlsx,.xlsm" multiple></div>
-      <p>The debit and credit G/Ls and memos for each entry are taken from last month's blocks, and each cover's open in-transit items carry forward.</p>
-      <p id="books-status" role="status"></p>
-    </section>
-    <section class="panel" aria-labelledby="invoice-heading">
-      <h2 id="invoice-heading">LendKey invoice (Charge Cards)</h2>
-      <div class="drop" id="invoice-drop"><label for="invoice-file">Drop the LendKey invoice paid this month</label><input id="invoice-file" type="file" accept=".pdf"></div>
-      <p>Splits the LendKey payment into Home Improvement, Consolidation and Student entries.</p>
-      <p id="invoice-status" role="status"></p>
-    </section>
-    <section class="panel">
-      <label class="confirmation"><input id="confirm" type="checkbox"> I verified the month and source files.</label>
-      <button id="run" type="button">Prepare VIZO reconciliations</button>
-      <p id="status" role="status" aria-live="polite"></p>
-    </section>
-    <section class="panel" id="results" hidden>
-      <div class="output"><h2>VIZO reconciliations</h2><button id="download" type="button">Download ZIP</button></div>
-      <div id="summary" class="table"></div>
-      <p>The ZIP holds each account's workbook with the cover filled in, and VIZO entries with every entry to make in Wisdom (yellow) and every item to review (red).</p>
-    </section>
+  <main class="gate" id="gate" hidden>
+    <h1>Finance Reconciliations</h1>
+    <form id="gate-form">
+      <label for="gate-password">Password</label>
+      <input id="gate-password" type="password" autocomplete="current-password" required>
+      <label class="gate-remember"><input id="gate-remember" type="checkbox"> Keep me unlocked on this computer</label>
+      <button type="submit" id="gate-submit">Unlock</button>
+      <p id="gate-status" role="status" aria-live="polite"></p>
+    </form>
   </main>
+  <p class="gate-loading" id="gate-loading">Opening…</p>
 </body>
 </html>

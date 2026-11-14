@@ -1,5 +1,5 @@
 # Finance Reconciliations
 
-Open `index.html` in a modern browser to run the app. To run it offline, download the repository and extract all files into one folder before opening `index.html`.
+The published site is password protected: each page asks for the password and then opens in the browser. Pages, scripts and styles are stored encrypted in `site/`; the open-source libraries alongside them are published unchanged.
 
-The app reads uploaded files and creates Excel downloads in the browser. This repository is for application source and its bundled dependencies.
+Files dropped into the pages are read and processed in the browser and are never uploaded.
