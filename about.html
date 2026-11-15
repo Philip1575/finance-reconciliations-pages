@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' blob:; style-src 'self' blob:; img-src 'self' blob: data:; font-src 'self' blob: data:; connect-src 'self'; worker-src 'self' blob:; base-uri 'none'; form-action 'none'">
+  <title>Finance Reconciliations</title>
+  <link rel="stylesheet" href="gate.css">
+  <script defer src="gate.js"></script>
+</head>
+<body>
+  <main class="gate" id="gate" hidden>
+    <h1>Finance Reconciliations</h1>
+    <form id="gate-form">
+      <label for="gate-password">Password</label>
+      <input id="gate-password" type="password" autocomplete="current-password" required>
+      <label class="gate-remember"><input id="gate-remember" type="checkbox"> Keep me unlocked on this computer</label>
+      <button type="submit" id="gate-submit">Unlock</button>
+      <p id="gate-status" role="status" aria-live="polite"></p>
+    </form>
+  </main>
+  <p class="gate-loading" id="gate-loading">Opening…</p>
+</body>
+</html>

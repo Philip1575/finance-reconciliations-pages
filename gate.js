@@ -54,7 +54,7 @@
     }));
     await Promise.all([...doc.querySelectorAll("img[src]")].map(async image => {
       const src = image.getAttribute("src");
-      if (own(src)) image.setAttribute("src", await decrypted(src, /\.svg$/i.test(src) ? "image/svg+xml" : "image/png"));
+      if (own(src)) image.setAttribute("src", await decrypted(src, /\.svg$/i.test(src) ? "image/svg+xml" : /\.jpe?g$/i.test(src) ? "image/jpeg" : /\.webp$/i.test(src) ? "image/webp" : "image/png"));
     }));
     const sources = [...doc.querySelectorAll("script[src]")].map(script => script.getAttribute("src"));
     doc.querySelectorAll("script").forEach(script => script.remove());
